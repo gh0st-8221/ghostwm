@@ -9,6 +9,8 @@
 
 #define DEFAULT_WIDTH  2558
 #define DEFAULT_HEIGHT 1438
+#define PRIMARY_W      2560
+#define PRIMARY_H      1440
 
 #define MODKEY Mod4Mask
 
@@ -22,18 +24,16 @@ static struct KeyBinding keys[] = {
     { MODKEY, XK_q, "alacritty" },
     { MODKEY, XK_w, "firefox" },
     { MODKEY, XK_c, "close-window" },
-    { MODKEY, XK_d, "fuzzel" },
+    { MODKEY, XK_d, "rofi" },
     { MODKEY, XK_p, "playerctl play-pause" },
-    { MODKEY | ShiftMask, XK_w, "~/.config/driftwm/ironbar-toggle" },
+    { MODKEY | ShiftMask, XK_w, "~/git/polybar-toggle/polybar-toggle" },
     { MODKEY | ShiftMask, XK_p, "poweroff" },
     { MODKEY | ShiftMask, XK_r, "reboot" },
     { MODKEY | ShiftMask, XK_g, "openrgb --profile ghost" },
     { MODKEY, XK_Tab, "alt-tab" },
+    { MODKEY, XK_f, "fullscreen" },
     { MODKEY, XK_s, "steam" },
     { MODKEY, XK_space, "setxkbmap -layout us,ua -option grp:win_space_toggle" },
-    { Mod1Mask, XK_Print, "sh -c 'grim -g \"$(slurp)\" - | wl-copy'" },
-    { 0, XK_Print, "sh -c 'grim ~/Screenshots/screenshot_$(date +%Y%m%d_%H%M%S).png'" },
-    { ControlMask, XK_Print, "sh -c 'grim -g \"$(slurp)\" ~/Screenshot_$(date +%Y%m%d_%H%M%S).png'" },
 };
 
 #endif

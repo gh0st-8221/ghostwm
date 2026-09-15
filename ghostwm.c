@@ -7,8 +7,6 @@
 #include <sys/wait.h>
 #include "config.h"
 
-static int next_x = 50;
-static int next_y = 50;
 static XWindowAttributes start_attr;
 static Atom wm_delete_window;
 static Atom wm_protocols;
@@ -103,12 +101,12 @@ int main(void) {
             case MapRequest: {
                 XSelectInput(dpy, ev.xmap.window, EnterWindowMask | FocusChangeMask | StructureNotifyMask);
                 
-                XMoveResizeWindow(dpy, ev.xmap.window, next_x, next_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
-                next_x += 30;
-                next_y += 30;
-                if (next_x > 400) next_x = 50;
-                if (next_y > 400) next_y = 50;
+                int center_x = (PRIMARY_W - DEFAULT_WIDTH) / 2;
+                int center_y = (PRIMARY_H - DEFAULT_HEIGHT) / 2;
+                if (center_x < 0) center_x = 0;
+                if (center_y < 0) center_y = 0;
 
+                XMoveResizeWindow(dpy, ev.xmap.window, center_x, center_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
                 XMapWindow(dpy, ev.xmap.window);
                 XSetWindowBorderWidth(dpy, ev.xmap.window, BORDER_WIDTH);
                 XSetWindowBorder(dpy, ev.xmap.window, COLOR_BORDER);
@@ -170,7 +168,13 @@ int main(void) {
                 }
 
                 if (mod == MODKEY && keysym == XK_Tab) {
-                    XCirculateSubwindowsDown(dpy, root);
+                    XCirculateSubwindows(dpy, root, RaiseLowest);
+                    break;
+                }
+
+                if (mod == MODKEY && keysym == XK_f && focused_window != None && focused_window != root) {
+                    XMoveResizeWindow(dpy, focused_window, 0, 0, PRIMARY_W, PRIMARY_H);
+                    XRaiseWindow(dpy, focused_window);
                     break;
                 }
 

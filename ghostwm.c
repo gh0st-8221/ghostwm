@@ -12,6 +12,7 @@ static int next_y = 50;
 static XWindowAttributes start_attr;
 static Atom wm_delete_window;
 static Atom wm_protocols;
+static Window focused_window = None;
 
 static void spawn(const char *cmd) {
     if (fork() == 0) {
@@ -63,16 +64,23 @@ static void grab_buttons(Display *dpy, Window root) {
     XGrabButton(dpy, Button3, Mod1Mask, root, True, ButtonPressMask | ButtonReleaseMask | PointerMotionMask, GrabModeAsync, GrabModeAsync, None, None);
 }
 
+static int x_error_handler(Display *dpy, XErrorEvent *ee) {
+    (void)dpy;
+    (void)ee;
+    return 0;
+}
+
 int main(void) {
     Display *dpy;
     Window root;
     XEvent ev;
     Cursor cursor;
-    Window focused_window = None;
 
     if (!(dpy = XOpenDisplay(NULL))) {
         exit(1);
     }
+
+    XSetErrorHandler(x_error_handler);
 
     root = DefaultRootWindow(dpy);
     wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
@@ -93,7 +101,7 @@ int main(void) {
         XNextEvent(dpy, &ev);
         switch (ev.type) {
             case MapRequest: {
-                XSelectInput(dpy, ev.xmap.window, EnterWindowMask | FocusChangeMask);
+                XSelectInput(dpy, ev.xmap.window, EnterWindowMask | FocusChangeMask | StructureNotifyMask);
                 
                 XMoveResizeWindow(dpy, ev.xmap.window, next_x, next_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
                 next_x += 30;
@@ -104,6 +112,14 @@ int main(void) {
                 XMapWindow(dpy, ev.xmap.window);
                 XSetWindowBorderWidth(dpy, ev.xmap.window, BORDER_WIDTH);
                 XSetWindowBorder(dpy, ev.xmap.window, COLOR_BORDER);
+                break;
+            }
+            case UnmapNotify:
+            case DestroyNotify: {
+                Window w = (ev.type == UnmapNotify) ? ev.xunmap.window : ev.xdestroywindow.window;
+                if (w == focused_window) {
+                    focused_window = None;
+                }
                 break;
             }
             case EnterNotify: {

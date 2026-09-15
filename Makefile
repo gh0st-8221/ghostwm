@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O3
-LIBS = -lX11
+LIBS = -lX11 -lXrandr
 TARGET = ghostwm
 
 all: $(TARGET)

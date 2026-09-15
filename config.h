@@ -7,10 +7,8 @@
 #define COLOR_BORDER 0x303030
 #define COLOR_FOCUS  0x0000ff
 
-#define DEFAULT_WIDTH  2558
-#define DEFAULT_HEIGHT 1438
-#define PRIMARY_W      2560
-#define PRIMARY_H      1440
+#define DEFAULT_WIDTH  1200
+#define DEFAULT_HEIGHT 800
 
 #define MODKEY Mod4Mask
 
@@ -24,14 +22,14 @@ static struct KeyBinding keys[] = {
     { MODKEY, XK_q, "alacritty" },
     { MODKEY, XK_w, "firefox" },
     { MODKEY, XK_c, "close-window" },
-    { MODKEY, XK_d, "rofi" },
+    { MODKEY, XK_d, "rofi -show drun" },
     { MODKEY, XK_p, "playerctl play-pause" },
     { MODKEY | ShiftMask, XK_w, "~/git/polybar-toggle/polybar-toggle" },
     { MODKEY | ShiftMask, XK_p, "poweroff" },
     { MODKEY | ShiftMask, XK_r, "reboot" },
     { MODKEY | ShiftMask, XK_g, "openrgb --profile ghost" },
     { MODKEY, XK_Tab, "alt-tab" },
-    { MODKEY, XK_f, "fullscreen" },
+    { MODKEY, XK_x, "center" },
     { MODKEY, XK_s, "steam" },
     { MODKEY, XK_space, "setxkbmap -layout us,ua -option grp:win_space_toggle" },
 };

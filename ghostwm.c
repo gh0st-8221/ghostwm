@@ -9,7 +9,14 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/time.h>
+#include <math.h>
 #include "config.h"
+
+#define MAIN_MONITOR_WIDTH  2560
+#define MAIN_MONITOR_HEIGHT 1440
+
+#define MAX_VELOCITY 1500.0
 
 typedef struct WinState {
     Window w;
@@ -25,6 +32,19 @@ static Atom wm_protocols;
 static Window focused_window = None;
 
 static double zoom_factor = 1.0;
+
+static int is_panning = 0;
+static double vel_x = 0.0;
+static double vel_y = 0.0;
+static struct timeval last_motion_time;
+static int last_dx = 0;
+static int last_dy = 0;
+
+static double get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
 
 static void save_window_state(Window w, int x, int y, unsigned int width, unsigned int height) {
     WinState *curr = saved_states;
@@ -129,8 +149,8 @@ static void set_focus(Display *dpy, Window w) {
 }
 
 static void apply_zoom(Display *dpy, Window root) {
-    int screen_w = DisplayWidth(dpy, DefaultScreen(dpy));
-    int screen_h = DisplayHeight(dpy, DefaultScreen(dpy));
+    int screen_w = MAIN_MONITOR_WIDTH;
+    int screen_h = MAIN_MONITOR_HEIGHT;
     int center_x = screen_w / 2;
     int center_y = screen_h / 2;
 
@@ -225,25 +245,77 @@ static void pan_viewport(Display *dpy, Window root, int dx, int dy) {
     }
 }
 
-static void cycle_windows(Display *dpy, Window root) {
+static void rofi_window_switcher(Display *dpy, Window root) {
     Window root_ret, parent_ret, *children;
     unsigned int nchildren;
-    if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren) && nchildren > 0) {
-        unsigned int valid_count = 0;
-        for (unsigned int i = 0; i < nchildren; i++) {
-            XWindowAttributes wa;
-            if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
-                valid_count++;
-            }
-        }
-
-        if (valid_count > 0) {
-            Window target = children[0];
-            XRaiseWindow(dpy, target);
-            set_focus(dpy, target);
-        }
-        XFree(children);
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren) || nchildren == 0) {
+        return;
     }
+
+    char tmp_path[] = "/tmp/ghostwm_rofi_XXXXXX";
+    int fd = mkstemp(tmp_path);
+    if (fd == -1) {
+        if (children) XFree(children);
+        return;
+    }
+    FILE *tmp_fp = fdopen(fd, "w");
+
+    int valid_count = 0;
+    for (unsigned int i = 0; i < nchildren; i++) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+            char *name = NULL;
+            if (XFetchName(dpy, children[i], &name) && name) {
+                fprintf(tmp_fp, "%s [0x%lx]\n", name, children[i]);
+                XFree(name);
+            } else {
+                fprintf(tmp_fp, "Window [0x%lx]\n", children[i]);
+            }
+            valid_count++;
+        }
+    }
+    if (children) XFree(children);
+    fclose(tmp_fp);
+
+    if (valid_count > 0) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "cat %s | rofi -dmenu -i -p 'Switch to:'", tmp_path);
+        FILE *rofi_out = popen(cmd, "r");
+        if (rofi_out) {
+            char selected_line[256];
+            if (fgets(selected_line, sizeof(selected_line), rofi_out)) {
+                char *hex_start = strrchr(selected_line, '[');
+                if (hex_start) {
+                    Window target_w = None;
+                    if (sscanf(hex_start, "[0x%lx]", &target_w) == 1 && target_w != None) {
+                        XWindowAttributes wa;
+                        if (XGetWindowAttributes(dpy, target_w, &wa)) {
+                            int screen_w = MAIN_MONITOR_WIDTH;
+                            int screen_h = MAIN_MONITOR_HEIGHT;
+
+                            int target_center_x = wa.x + (wa.width / 2);
+                            int target_center_y = wa.y + (wa.height / 2);
+
+                            int screen_center_x = screen_w / 2;
+                            int screen_center_y = screen_h / 2;
+
+                            int dx = target_center_x - screen_center_x;
+                            int dy = target_center_y - screen_center_y;
+
+                            vel_x = 0.0;
+                            vel_y = 0.0;
+
+                            pan_viewport(dpy, root, dx, dy);
+                            XRaiseWindow(dpy, target_w);
+                            set_focus(dpy, target_w);
+                        }
+                    }
+                }
+            }
+            pclose(rofi_out);
+        }
+    }
+    unlink(tmp_path);
 }
 
 int main(void) {
@@ -267,6 +339,8 @@ int main(void) {
     cursor = XCreateFontCursor(dpy, XC_dot);
     XDefineCursor(dpy, root, cursor);
 
+    XWarpPointer(dpy, None, root, 0, 0, 0, 0, MAIN_MONITOR_WIDTH / 2, MAIN_MONITOR_HEIGHT / 2);
+
     grab_keys(dpy, root);
     grab_buttons(dpy, root);
 
@@ -276,129 +350,187 @@ int main(void) {
     XButtonEvent det_cursor = {0};
 
     while (1) {
-        XNextEvent(dpy, &ev);
-        switch (ev.type) {
-            case MapRequest: {
-                XSelectInput(dpy, ev.xmap.window, EnterWindowMask | FocusChangeMask | StructureNotifyMask);
-                
-                int rx, ry, wx, wy;
-                unsigned int mask;
-                Window r_ret, c_ret;
-                int spawn_x = 0, spawn_y = 0;
+        while (XPending(dpy)) {
+            XNextEvent(dpy, &ev);
+            switch (ev.type) {
+                case MapRequest: {
+                    XSelectInput(dpy, ev.xmap.window, EnterWindowMask | FocusChangeMask | StructureNotifyMask);
+                    
+                    int rx, ry, wx, wy;
+                    unsigned int mask;
+                    Window r_ret, c_ret;
+                    int spawn_x = 0, spawn_y = 0;
 
-                if (XQueryPointer(dpy, root, &r_ret, &c_ret, &rx, &ry, &wx, &wy, &mask)) {
-                    spawn_x = rx - (DEFAULT_WIDTH / 2);
-                    spawn_y = ry - (DEFAULT_HEIGHT / 2);
-                }
-
-                XMoveResizeWindow(dpy, ev.xmap.window, spawn_x, spawn_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
-                save_window_state(ev.xmap.window, spawn_x, spawn_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
-                XMapWindow(dpy, ev.xmap.window);
-                XSetWindowBorderWidth(dpy, ev.xmap.window, BORDER_WIDTH);
-                set_focus(dpy, ev.xmap.window);
-                break;
-            }
-            case UnmapNotify:
-            case DestroyNotify: {
-                Window w = (ev.type == UnmapNotify) ? ev.xunmap.window : ev.xdestroywindow.window;
-                remove_window_state(w);
-                if (w == focused_window) {
-                    set_focus(dpy, None);
-                }
-                break;
-            }
-            case EnterNotify: {
-                set_focus(dpy, ev.xcrossing.window);
-                break;
-            }
-            case ButtonPress: {
-                if ((ev.xbutton.state & Mod4Mask)) {
-                    if (ev.xbutton.button == Button5) { // Колесо вниз (від'їзд)
-                        zoom_factor -= 0.1;
-                        if (zoom_factor < 0.2) zoom_factor = 0.2;
-                        apply_zoom(dpy, root);
-                        break;
-                    } else if (ev.xbutton.button == Button4) { // Колесо вгору (приближення)
-                        zoom_factor += 0.1;
-                        if (zoom_factor > 2.5) zoom_factor = 2.5;
-                        apply_zoom(dpy, root);
-                        break;
-                    } else if (ev.xbutton.button == Button2) { // СКМ (скидання)
-                        zoom_factor = 1.0;
-                        apply_zoom(dpy, root);
-                        break;
+                    if (XQueryPointer(dpy, root, &r_ret, &c_ret, &rx, &ry, &wx, &wy, &mask)) {
+                        spawn_x = rx - (DEFAULT_WIDTH / 2);
+                        spawn_y = ry - (DEFAULT_HEIGHT / 2);
+                    } else {
+                        spawn_x = (MAIN_MONITOR_WIDTH - DEFAULT_WIDTH) / 2;
+                        spawn_y = (MAIN_MONITOR_HEIGHT - DEFAULT_HEIGHT) / 2;
                     }
-                }
 
-                if (ev.xbutton.subwindow != None) {
-                    set_focus(dpy, ev.xbutton.subwindow);
-                    XGetWindowAttributes(dpy, focused_window, &start_attr);
-                    det_cursor = ev.xbutton;
-                    XRaiseWindow(dpy, focused_window);
-                } else {
-                    det_cursor = ev.xbutton;
-                }
-                break;
-            }
-            case MotionNotify: {
-                int xdiff = ev.xmotion.x_root - det_cursor.x_root;
-                int ydiff = ev.xmotion.y_root - det_cursor.y_root;
-
-                if ((ev.xmotion.state & Mod4Mask) && det_cursor.button == Button1) {
-                    pan_viewport(dpy, root, -xdiff, -ydiff);
-                    det_cursor.x_root = ev.xmotion.x_root;
-                    det_cursor.y_root = ev.xmotion.y_root;
-                } else if ((ev.xmotion.state & Mod1Mask) && focused_window != None) {
-                    if (det_cursor.button == Button1) {
-                        int nx = start_attr.x + xdiff;
-                        int ny = start_attr.y + ydiff;
-                        XMoveWindow(dpy, focused_window, nx, ny);
-                        
-                        WinState *st = get_window_state(focused_window);
-                        if (st) {
-                            st->x = nx;
-                            st->y = ny;
-                        }
-                    } else if (det_cursor.button == Button3) {
-                        int new_w = start_attr.width + xdiff;
-                        int new_h = start_attr.height + ydiff;
-                        if (new_w < 100) new_w = 100;
-                        if (new_h < 100) new_h = 100;
-                        XResizeWindow(dpy, focused_window, new_w, new_h);
-                        
-                        WinState *st = get_window_state(focused_window);
-                        if (st) {
-                            st->width = new_w;
-                            st->height = new_h;
-                        }
-                    }
-                }
-                break;
-            }
-            case KeyPress: {
-                KeySym keysym = XLookupKeysym(&ev.xkey, 0);
-                unsigned int mod = ev.xkey.state & ~LockMask & ~Mod2Mask;
-
-                if (mod == Mod1Mask && keysym == XK_Tab) {
-                    cycle_windows(dpy, root);
+                    XMoveResizeWindow(dpy, ev.xmap.window, spawn_x, spawn_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+                    save_window_state(ev.xmap.window, spawn_x, spawn_y, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+                    XMapWindow(dpy, ev.xmap.window);
+                    XSetWindowBorderWidth(dpy, ev.xmap.window, BORDER_WIDTH);
+                    set_focus(dpy, ev.xmap.window);
                     break;
                 }
-
-                if (mod == MODKEY && keysym == XK_c && focused_window != None && focused_window != root) {
-                    send_event(dpy, focused_window, wm_delete_window);
+                case UnmapNotify:
+                case DestroyNotify: {
+                    Window w = (ev.type == UnmapNotify) ? ev.xunmap.window : ev.xdestroywindow.window;
+                    remove_window_state(w);
+                    if (w == focused_window) {
+                        set_focus(dpy, None);
+                    }
                     break;
                 }
-
-                for (unsigned long i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-                    if (keysym == keys[i].keysym && mod == keys[i].mod) {
-                        spawn(keys[i].cmd);
-                    }
+                case EnterNotify: {
+                    set_focus(dpy, ev.xcrossing.window);
+                    break;
                 }
-                break;
+                case ButtonPress: {
+                    vel_x = 0.0;
+                    vel_y = 0.0;
+
+                    if ((ev.xbutton.state & Mod4Mask)) {
+                        if (ev.xbutton.button == Button1) {
+                            is_panning = 1;
+                            gettimeofday(&last_motion_time, NULL);
+                            last_dx = 0;
+                            last_dy = 0;
+                        } else if (ev.xbutton.button == Button5) {
+                            zoom_factor -= 0.1;
+                            if (zoom_factor < 0.2) zoom_factor = 0.2;
+                            apply_zoom(dpy, root);
+                            break;
+                        } else if (ev.xbutton.button == Button4) {
+                            zoom_factor += 0.1;
+                            if (zoom_factor > 2.5) zoom_factor = 2.5;
+                            apply_zoom(dpy, root);
+                            break;
+                        } else if (ev.xbutton.button == Button2) {
+                            zoom_factor = 1.0;
+                            apply_zoom(dpy, root);
+                            break;
+                        }
+                    }
+
+                    if (ev.xbutton.subwindow != None) {
+                        set_focus(dpy, ev.xbutton.subwindow);
+                        XGetWindowAttributes(dpy, focused_window, &start_attr);
+                        det_cursor = ev.xbutton;
+                        XRaiseWindow(dpy, focused_window);
+                    } else {
+                        det_cursor = ev.xbutton;
+                    }
+                    break;
+                }
+                case ButtonRelease: {
+                    if (ev.xbutton.button == Button1 && is_panning) {
+                        is_panning = 0;
+                        
+                        double now = get_time_ms();
+                        double last_time = (double)last_motion_time.tv_sec * 1000.0 + (double)last_motion_time.tv_usec / 1000.0;
+                        double dt = now - last_time;
+
+                        if (dt < 50.0 && dt > 0.0) {
+                            vel_x = (double)last_dx / (dt / 1000.0);
+                            vel_y = (double)last_dy / (dt / 1000.0);
+
+                            if (vel_x > MAX_VELOCITY) vel_x = MAX_VELOCITY;
+                            if (vel_x < -MAX_VELOCITY) vel_x = -MAX_VELOCITY;
+                            if (vel_y > MAX_VELOCITY) vel_y = MAX_VELOCITY;
+                            if (vel_y < -MAX_VELOCITY) vel_y = -MAX_VELOCITY;
+                        } else {
+                            vel_x = 0.0;
+                            vel_y = 0.0;
+                        }
+                    }
+                    break;
+                }
+                case MotionNotify: {
+                    int xdiff = ev.xmotion.x_root - det_cursor.x_root;
+                    int ydiff = ev.xmotion.y_root - det_cursor.y_root;
+
+                    if ((ev.xmotion.state & Mod4Mask) && det_cursor.button == Button1) {
+                        pan_viewport(dpy, root, -xdiff, -ydiff);
+                        
+                        last_dx = -xdiff;
+                        last_dy = -ydiff;
+                        gettimeofday(&last_motion_time, NULL);
+
+                        det_cursor.x_root = ev.xmotion.x_root;
+                        det_cursor.y_root = ev.xmotion.y_root;
+                    } else if ((ev.xmotion.state & Mod1Mask) && focused_window != None) {
+                        if (det_cursor.button == Button1) {
+                            int nx = start_attr.x + xdiff;
+                            int ny = start_attr.y + ydiff;
+                            XMoveWindow(dpy, focused_window, nx, ny);
+                            
+                            WinState *st = get_window_state(focused_window);
+                            if (st) {
+                                st->x = nx;
+                                st->y = ny;
+                            }
+                        } else if (det_cursor.button == Button3) {
+                            int new_w = start_attr.width + xdiff;
+                            int new_h = start_attr.height + ydiff;
+                            if (new_w < 100) new_w = 100;
+                            if (new_h < 100) new_h = 100;
+                            XResizeWindow(dpy, focused_window, new_w, new_h);
+                            
+                            WinState *st = get_window_state(focused_window);
+                            if (st) {
+                                st->width = new_w;
+                                st->height = new_h;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case KeyPress: {
+                    KeySym keysym = XLookupKeysym(&ev.xkey, 0);
+                    unsigned int mod = ev.xkey.state & ~LockMask & ~Mod2Mask;
+
+                    if (mod == Mod1Mask && keysym == XK_Tab) {
+                        rofi_window_switcher(dpy, root);
+                        break;
+                    }
+
+                    if (mod == MODKEY && keysym == XK_c && focused_window != None && focused_window != root) {
+                        send_event(dpy, focused_window, wm_delete_window);
+                        break;
+                    }
+
+                    for (unsigned long i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+                        if (keysym == keys[i].keysym && mod == keys[i].mod) {
+                            spawn(keys[i].cmd);
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
             }
-            default:
-                break;
         }
+
+        if (!is_panning && (fabs(vel_x) > 1.0 || fabs(vel_y) > 1.0)) {
+            double dt = 0.016;
+            int step_x = (int)(vel_x * dt);
+            int step_y = (int)(vel_y * dt);
+
+            if (step_x != 0 || step_y != 0) {
+                pan_viewport(dpy, root, step_x, step_y);
+            }
+
+            vel_x *= 0.95;
+            vel_y *= 0.95;
+            
+            XFlush(dpy);
+        }
+
+        usleep(16000);
     }
 
     XCloseDisplay(dpy);

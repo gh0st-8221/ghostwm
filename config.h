@@ -7,8 +7,8 @@
 #define COLOR_BORDER 0x303030
 #define COLOR_FOCUS  0x0000ff
 
-#define DEFAULT_WIDTH  1200
-#define DEFAULT_HEIGHT 800
+#define DEFAULT_WIDTH  2560
+#define DEFAULT_HEIGHT 1440
 
 #define MODKEY Mod4Mask
 

@@ -15,7 +15,6 @@
 
 #define MAIN_MONITOR_WIDTH  2560
 #define MAIN_MONITOR_HEIGHT 1440
-
 #define MAX_VELOCITY 1500.0
 
 typedef struct WinState {
@@ -32,7 +31,6 @@ static Atom wm_protocols;
 static Window focused_window = None;
 
 static double zoom_factor = 1.0;
-
 static int is_panning = 0;
 static double vel_x = 0.0;
 static double vel_y = 0.0;
@@ -53,6 +51,7 @@ static void save_window_state(Window w, int x, int y, unsigned int width, unsign
         curr = curr->next;
     }
     WinState *node = malloc(sizeof(WinState));
+    if (!node) return;
     node->w = w;
     node->x = x;
     node->y = y;
@@ -115,26 +114,33 @@ static void spawn(const char *cmd) {
 }
 
 static void send_event(Display *dpy, Window w, Atom proto) {
-    XEvent ev;
     int n;
-    Atom *protocols;
-    
+    Atom *protocols = NULL;
+    int exists = 0;
+
     if (XGetWMProtocols(dpy, w, &protocols, &n)) {
-        while (--n >= 0)
+        while (--n >= 0) {
             if (protocols[n] == proto) {
-                ev.type = ClientMessage;
-                ev.xclient.window = w;
-                ev.xclient.message_type = wm_protocols;
-                ev.xclient.format = 32;
-                ev.xclient.data.l[0] = wm_delete_window;
-                ev.xclient.data.l[1] = CurrentTime;
-                XSendEvent(dpy, w, False, NoEventMask, &ev);
-                XFree(protocols);
-                return;
+                exists = 1;
+                break;
             }
-        XFree(protocols);
+        }
+        if (protocols) XFree(protocols);
     }
-    XKillClient(dpy, w);
+
+    if (exists) {
+        XEvent ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = ClientMessage;
+        ev.xclient.window = w;
+        ev.xclient.message_type = wm_protocols;
+        ev.xclient.format = 32;
+        ev.xclient.data.l[0] = wm_delete_window;
+        ev.xclient.data.l[1] = CurrentTime;
+        XSendEvent(dpy, w, False, NoEventMask, &ev);
+    } else {
+        XKillClient(dpy, w);
+    }
 }
 
 static void set_focus(Display *dpy, Window w) {
@@ -154,7 +160,7 @@ static void apply_zoom(Display *dpy, Window root) {
     int center_x = screen_w / 2;
     int center_y = screen_h / 2;
 
-    Window root_ret, parent_ret, *children;
+    Window root_ret, parent_ret, *children = NULL;
     unsigned int nchildren;
     if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) {
         for (unsigned int i = 0; i < nchildren; i++) {
@@ -200,8 +206,7 @@ static void grab_keys(Display *dpy, Window root) {
     }
 
     for (unsigned long i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        KeySym keysym = keys[i].keysym;
-        KeyCode code = XKeysymToKeycode(dpy, keysym);
+        KeyCode code = XKeysymToKeycode(dpy, keys[i].keysym);
         if (code) {
             XGrabKey(dpy, code, keys[i].mod, root, True, GrabModeAsync, GrabModeAsync);
             XGrabKey(dpy, code, keys[i].mod | LockMask, root, True, GrabModeAsync, GrabModeAsync);
@@ -227,7 +232,7 @@ static int x_error_handler(Display *dpy, XErrorEvent *ee) {
 }
 
 static void pan_viewport(Display *dpy, Window root, int dx, int dy) {
-    Window root_ret, parent_ret, *children;
+    Window root_ret, parent_ret, *children = NULL;
     unsigned int nchildren;
     if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) {
         for (unsigned int i = 0; i < nchildren; i++) {
@@ -246,9 +251,10 @@ static void pan_viewport(Display *dpy, Window root, int dx, int dy) {
 }
 
 static void rofi_window_switcher(Display *dpy, Window root) {
-    Window root_ret, parent_ret, *children;
+    Window root_ret, parent_ret, *children = NULL;
     unsigned int nchildren;
     if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren) || nchildren == 0) {
+        if (children) XFree(children);
         return;
     }
 
@@ -290,17 +296,10 @@ static void rofi_window_switcher(Display *dpy, Window root) {
                     if (sscanf(hex_start, "[0x%lx]", &target_w) == 1 && target_w != None) {
                         XWindowAttributes wa;
                         if (XGetWindowAttributes(dpy, target_w, &wa)) {
-                            int screen_w = MAIN_MONITOR_WIDTH;
-                            int screen_h = MAIN_MONITOR_HEIGHT;
-
                             int target_center_x = wa.x + (wa.width / 2);
                             int target_center_y = wa.y + (wa.height / 2);
-
-                            int screen_center_x = screen_w / 2;
-                            int screen_center_y = screen_h / 2;
-
-                            int dx = target_center_x - screen_center_x;
-                            int dy = target_center_y - screen_center_y;
+                            int dx = target_center_x - (MAIN_MONITOR_WIDTH / 2);
+                            int dy = target_center_y - (MAIN_MONITOR_HEIGHT / 2);
 
                             vel_x = 0.0;
                             vel_y = 0.0;
@@ -450,6 +449,8 @@ int main(void) {
                     break;
                 }
                 case MotionNotify: {
+                    while (XCheckTypedEvent(dpy, MotionNotify, &ev));
+
                     int xdiff = ev.xmotion.x_root - det_cursor.x_root;
                     int ydiff = ev.xmotion.y_root - det_cursor.y_root;
 

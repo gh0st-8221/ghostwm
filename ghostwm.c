@@ -68,7 +68,7 @@ int last_dy = 0;
 volatile sig_atomic_t reload_requested = 0;
 
 void handle_sigusr1(int sig) {
-    (void)sig; 
+    (void)sig;
     reload_requested = 1;
 }
 
@@ -84,9 +84,26 @@ void parse_key_str(char *kstr, char *cmd) {
     char *plus = strrchr(kstr, '+');
     char *k = plus ? plus + 1 : kstr;
     
-    KeySym sym = XStringToKeysym(k);
-    if (sym == NoSymbol && strlen(k) == 1) {
-        sym = k[0];
+    while (*k == ' ') k++;
+    
+    KeySym sym;
+    if (strstr(k, "Print")) {
+        sym = XK_Print;
+    } else {
+        char clean_k[64] = {0};
+        int j = 0;
+        for (int i = 0; k[i] && j < 63; i++) {
+            if (k[i] != ' ' && k[i] != '\t' && k[i] != '\n' && k[i] != '\r') {
+                clean_k[j++] = k[i];
+            }
+        }
+        if (clean_k[0] >= 'A' && clean_k[0] <= 'Z' && strlen(clean_k) == 1) {
+            clean_k[0] += 32;
+        }
+        sym = XStringToKeysym(clean_k);
+        if (sym == NoSymbol && strlen(clean_k) == 1) {
+            sym = clean_k[0];
+        }
     }
     
     if (sym != NoSymbol) {
@@ -369,13 +386,14 @@ void apply_zoom(Display *dpy, Window root) {
 void grab_keys(Display *dpy, Window root) {
     XUngrabKey(dpy, AnyKey, AnyModifier, root);
     
+    unsigned int ign[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask, 0x2000, 0x2000 | LockMask, 0x2000 | Mod2Mask, 0x2000 | LockMask | Mod2Mask};
+    
     for (int i = 0; i < keys_count; i++) {
         KeyCode code = XKeysymToKeycode(dpy, keys[i].keysym);
         if (code) {
-            XGrabKey(dpy, code, keys[i].mod, root, True, GrabModeAsync, GrabModeAsync);
-            XGrabKey(dpy, code, keys[i].mod | LockMask, root, True, GrabModeAsync, GrabModeAsync);
-            XGrabKey(dpy, code, keys[i].mod | Mod2Mask, root, True, GrabModeAsync, GrabModeAsync);
-            XGrabKey(dpy, code, keys[i].mod | LockMask | Mod2Mask, root, True, GrabModeAsync, GrabModeAsync);
+            for (int j = 0; j < 8; j++) {
+                XGrabKey(dpy, code, keys[i].mod | ign[j], root, True, GrabModeAsync, GrabModeAsync);
+            }
         }
     }
 }
@@ -601,7 +619,7 @@ int main(void) {
                 }
                 case KeyPress: {
                     KeySym keysym = XLookupKeysym(&ev.xkey, 0);
-                    unsigned int mod = ev.xkey.state & ~LockMask & ~Mod2Mask;
+                    unsigned int mod = ev.xkey.state & (ShiftMask | ControlMask | Mod1Mask | Mod4Mask);
 
                     for (int i = 0; i < keys_count; i++) {
                         if (keysym == keys[i].keysym && mod == keys[i].mod) {
@@ -609,6 +627,42 @@ int main(void) {
                                 if (focused_window != None && focused_window != root) {
                                     send_event(dpy, focused_window, wm_delete_window);
                                 }
+                            } else if (strcmp(keys[i].cmd, "workspace_1") == 0) {
+                                // Тепаємо вікно на DP монітор (2560x1440)
+                                if (focused_window != None && focused_window != root) {
+                                    int dp_x = 0, dp_y = 0;
+                                    sscanf(dp_pos, "%dx%d", &dp_x, &dp_y);
+                                    
+                                    int new_w = 2560 - (border_width * 2);
+                                    int new_h = 1440 - (border_width * 2);
+                                    
+                                    XMoveResizeWindow(dpy, focused_window, dp_x, dp_y, new_w, new_h);
+                                    WinState *st = get_window_state(focused_window);
+                                    if (st) { st->x = dp_x; st->y = dp_y; st->width = new_w; st->height = new_h; }
+                                }
+                            } else if (strcmp(keys[i].cmd, "workspace_2") == 0) {
+                                // Тепаємо вікно на HDMI монітор (1920x1080)
+                                if (focused_window != None && focused_window != root) {
+                                    int hdmi_x = 2560, hdmi_y = 310;
+                                    sscanf(hdmi_pos, "%dx%d", &hdmi_x, &hdmi_y);
+                                    
+                                    int new_w = 1920 - (border_width * 2);
+                                    int new_h = 1080 - (border_width * 2);
+
+                                    XMoveResizeWindow(dpy, focused_window, hdmi_x, hdmi_y, new_w, new_h);
+                                    WinState *st = get_window_state(focused_window);
+                                    if (st) { st->x = hdmi_x; st->y = hdmi_y; st->width = new_w; st->height = new_h; }
+                                }
+                            } else if (strcmp(keys[i].cmd, "cursor_workspace_1") == 0) {
+                                // Тепаємо курсор по центру DP (2560x1440)
+                                int dp_x = 0, dp_y = 0;
+                                sscanf(dp_pos, "%dx%d", &dp_x, &dp_y);
+                                XWarpPointer(dpy, None, root, 0, 0, 0, 0, dp_x + (2560 / 2), dp_y + (1440 / 2));
+                            } else if (strcmp(keys[i].cmd, "cursor_workspace_2") == 0) {
+                                // Тепаємо курсор по центру HDMI (1920x1080)
+                                int hdmi_x = 2560, hdmi_y = 310;
+                                sscanf(hdmi_pos, "%dx%d", &hdmi_x, &hdmi_y);
+                                XWarpPointer(dpy, None, root, 0, 0, 0, 0, hdmi_x + (1920 / 2), hdmi_y + (1080 / 2));
                             } else {
                                 spawn(keys[i].cmd);
                             }

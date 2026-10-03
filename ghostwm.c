@@ -59,7 +59,7 @@ Window focused_window = None;
 
 double zoom_factor = 1.0;
 int is_panning = 0;
-int is_tiling = 0;
+int is_tiling = 1;
 double vel_x = 0.0;
 double vel_y = 0.0;
 struct timeval last_motion_time;

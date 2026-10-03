@@ -14,8 +14,8 @@
 #include <pwd.h>
 #include <signal.h>
 
-#define MAIN_MONITOR_WIDTH  2560
-#define MAIN_MONITOR_HEIGHT 1440
+#define MAIN_MONITOR_WIDTH  1920
+#define MAIN_MONITOR_HEIGHT 1080
 #define MAX_VELOCITY 1500.0
 #define MAX_KEYS 128
 #define MAX_AUTOSTART 64
@@ -26,8 +26,8 @@ unsigned long color_fg = 0xffffff;
 unsigned long color_border = 0x303030;
 unsigned long color_focus = 0x0000ff;
 
-int default_width = 2560;
-int default_height = 1440;
+int default_width = 1920;
+int default_height = 1080;
 
 char hdmi_pos[64] = "2560x310";
 char dp_pos[64] = "0x0";
@@ -59,6 +59,7 @@ Window focused_window = None;
 
 double zoom_factor = 1.0;
 int is_panning = 0;
+int is_tiling = 0;
 double vel_x = 0.0;
 double vel_y = 0.0;
 struct timeval last_motion_time;
@@ -254,10 +255,14 @@ void setup_monitors(void) {
     if (!fp) return;
 
     char line[256];
+    char edp_name[64] = {0};
     char hdmi_name[64] = {0};
     char dp_name[64] = {0};
 
     while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "eDP", 3) == 0 && strstr(line, " connected")) {
+            sscanf(line, "%63s", edp_name);
+        }
         if (strncmp(line, "HDMI", 4) == 0 && strstr(line, " connected")) {
             sscanf(line, "%63s", hdmi_name);
         }
@@ -270,6 +275,12 @@ void setup_monitors(void) {
     char cmd[1024] = "xrandr";
     int run = 0;
     
+    if (edp_name[0] != '\0') {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), " --output %s --mode 1920x1080 --rate 60 --auto", edp_name);
+        strcat(cmd, tmp);
+        run = 1;
+    }
     if (hdmi_name[0] != '\0') {
         char tmp[128];
         snprintf(tmp, sizeof(tmp), " --output %s --pos %s --auto", hdmi_name, hdmi_pos);
@@ -343,7 +354,74 @@ void set_focus(Display *dpy, Window w) {
     }
 }
 
+void apply_tiling(Display *dpy, Window root) {
+    Window root_ret, parent_ret, *children = NULL;
+    unsigned int nchildren;
+    if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) {
+        int count = 0;
+        for (unsigned int i = 0; i < nchildren; i++) {
+            XWindowAttributes wa;
+            if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+                count++;
+            }
+        }
+
+        if (count > 0) {
+            int idx = 0;
+            int screen_w = MAIN_MONITOR_WIDTH;
+            int screen_h = MAIN_MONITOR_HEIGHT;
+            int half_w = screen_w / 2;
+
+            for (unsigned int i = 0; i < nchildren; i++) {
+                XWindowAttributes wa;
+                if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+                    int x, y, w, h;
+                    if (count == 1) {
+                        x = 0;
+                        y = 0;
+                        w = screen_w - (border_width * 2);
+                        h = screen_h - (border_width * 2);
+                    } else if (count == 2) {
+                        x = (idx == 0) ? 0 : half_w;
+                        y = 0;
+                        w = half_w - (border_width * 2);
+                        h = screen_h - (border_width * 2);
+                    } else {
+                        if (idx == 0) {
+                            x = 0;
+                            y = 0;
+                            w = half_w - (border_width * 2);
+                            h = screen_h - (border_width * 2);
+                        } else {
+                            int sub_h = screen_h / (count - 1);
+                            x = half_w;
+                            y = (idx - 1) * sub_h;
+                            w = half_w - (border_width * 2);
+                            h = sub_h - (border_width * 2);
+                        }
+                    }
+                    XMoveResizeWindow(dpy, children[i], x, y, w, h);
+                    WinState *st = get_window_state(children[i]);
+                    if (st) {
+                        st->x = x;
+                        st->y = y;
+                        st->width = w;
+                        st->height = h;
+                    }
+                    idx++;
+                }
+            }
+        }
+        if (children) XFree(children);
+    }
+}
+
 void apply_zoom(Display *dpy, Window root) {
+    if (is_tiling) {
+        apply_tiling(dpy, root);
+        return;
+    }
+
     int screen_w = MAIN_MONITOR_WIDTH;
     int screen_h = MAIN_MONITOR_HEIGHT;
     int center_x = screen_w / 2;
@@ -414,6 +492,7 @@ int x_error_handler(Display *dpy, XErrorEvent *ee) {
 }
 
 void pan_viewport(Display *dpy, Window root, int dx, int dy) {
+    if (is_tiling) return;
     Window root_ret, parent_ret, *children = NULL;
     unsigned int nchildren;
     if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) {
@@ -500,6 +579,10 @@ int main(void) {
                     XMapWindow(dpy, ev.xmap.window);
                     XSetWindowBorderWidth(dpy, ev.xmap.window, border_width);
                     set_focus(dpy, ev.xmap.window);
+
+                    if (is_tiling) {
+                        apply_tiling(dpy, root);
+                    }
                     break;
                 }
                 case UnmapNotify:
@@ -508,6 +591,9 @@ int main(void) {
                     remove_window_state(w);
                     if (w == focused_window) {
                         set_focus(dpy, None);
+                    }
+                    if (is_tiling) {
+                        apply_tiling(dpy, root);
                     }
                     break;
                 }
@@ -526,14 +612,18 @@ int main(void) {
                             last_dx = 0;
                             last_dy = 0;
                         } else if (ev.xbutton.button == Button5) {
-                            zoom_factor -= 0.1;
-                            if (zoom_factor < 0.2) zoom_factor = 0.2;
-                            apply_zoom(dpy, root);
+                            if (!is_tiling) {
+                                zoom_factor -= 0.1;
+                                if (zoom_factor < 0.2) zoom_factor = 0.2;
+                                apply_zoom(dpy, root);
+                            }
                             break;
                         } else if (ev.xbutton.button == Button4) {
-                            zoom_factor += 0.1;
-                            if (zoom_factor > 2.5) zoom_factor = 2.5;
-                            apply_zoom(dpy, root);
+                            if (!is_tiling) {
+                                zoom_factor += 0.1;
+                                if (zoom_factor > 2.5) zoom_factor = 2.5;
+                                apply_zoom(dpy, root);
+                            }
                             break;
                         } else if (ev.xbutton.button == Button2) {
                             zoom_factor = 1.0;
@@ -582,15 +672,15 @@ int main(void) {
                     int ydiff = ev.xmotion.y_root - det_cursor.y_root;
 
                     if ((ev.xmotion.state & Mod4Mask) && det_cursor.button == Button1) {
-                        pan_viewport(dpy, root, -xdiff, -ydiff);
-                        
-                        last_dx = -xdiff;
-                        last_dy = -ydiff;
-                        gettimeofday(&last_motion_time, NULL);
-
+                        if (!is_tiling) {
+                            pan_viewport(dpy, root, -xdiff, -ydiff);
+                            last_dx = -xdiff;
+                            last_dy = -ydiff;
+                            gettimeofday(&last_motion_time, NULL);
+                        }
                         det_cursor.x_root = ev.xmotion.x_root;
                         det_cursor.y_root = ev.xmotion.y_root;
-                    } else if ((ev.xmotion.state & Mod1Mask) && focused_window != None) {
+                    } else if ((ev.xmotion.state & Mod1Mask) && focused_window != None && !is_tiling) {
                         if (det_cursor.button == Button1) {
                             int nx = start_attr.x + xdiff;
                             int ny = start_attr.y + ydiff;
@@ -627,21 +717,22 @@ int main(void) {
                                 if (focused_window != None && focused_window != root) {
                                     send_event(dpy, focused_window, wm_delete_window);
                                 }
+                            } else if (strcmp(keys[i].cmd, "alt-tab") == 0) {
+                                is_tiling = !is_tiling;
+                                apply_tiling(dpy, root);
                             } else if (strcmp(keys[i].cmd, "workspace_1") == 0) {
-                                // Тепаємо вікно на DP монітор (2560x1440)
                                 if (focused_window != None && focused_window != root) {
                                     int dp_x = 0, dp_y = 0;
                                     sscanf(dp_pos, "%dx%d", &dp_x, &dp_y);
                                     
-                                    int new_w = 2560 - (border_width * 2);
-                                    int new_h = 1440 - (border_width * 2);
+                                    int new_w = MAIN_MONITOR_WIDTH - (border_width * 2);
+                                    int new_h = MAIN_MONITOR_HEIGHT - (border_width * 2);
                                     
                                     XMoveResizeWindow(dpy, focused_window, dp_x, dp_y, new_w, new_h);
                                     WinState *st = get_window_state(focused_window);
                                     if (st) { st->x = dp_x; st->y = dp_y; st->width = new_w; st->height = new_h; }
                                 }
                             } else if (strcmp(keys[i].cmd, "workspace_2") == 0) {
-                                // Тепаємо вікно на HDMI монітор (1920x1080)
                                 if (focused_window != None && focused_window != root) {
                                     int hdmi_x = 2560, hdmi_y = 310;
                                     sscanf(hdmi_pos, "%dx%d", &hdmi_x, &hdmi_y);
@@ -654,12 +745,10 @@ int main(void) {
                                     if (st) { st->x = hdmi_x; st->y = hdmi_y; st->width = new_w; st->height = new_h; }
                                 }
                             } else if (strcmp(keys[i].cmd, "cursor_workspace_1") == 0) {
-                                // Тепаємо курсор по центру DP (2560x1440)
                                 int dp_x = 0, dp_y = 0;
                                 sscanf(dp_pos, "%dx%d", &dp_x, &dp_y);
-                                XWarpPointer(dpy, None, root, 0, 0, 0, 0, dp_x + (2560 / 2), dp_y + (1440 / 2));
+                                XWarpPointer(dpy, None, root, 0, 0, 0, 0, dp_x + (MAIN_MONITOR_WIDTH / 2), dp_y + (MAIN_MONITOR_HEIGHT / 2));
                             } else if (strcmp(keys[i].cmd, "cursor_workspace_2") == 0) {
-                                // Тепаємо курсор по центру HDMI (1920x1080)
                                 int hdmi_x = 2560, hdmi_y = 310;
                                 sscanf(hdmi_pos, "%dx%d", &hdmi_x, &hdmi_y);
                                 XWarpPointer(dpy, None, root, 0, 0, 0, 0, hdmi_x + (1920 / 2), hdmi_y + (1080 / 2));

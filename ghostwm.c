@@ -90,6 +90,14 @@ void parse_key_str(char *kstr, char *cmd) {
     KeySym sym;
     if (strstr(k, "Print")) {
         sym = XK_Print;
+    } else if (strcmp(k, "Left") == 0) {
+        sym = XK_Left;
+    } else if (strcmp(k, "Right") == 0) {
+        sym = XK_Right;
+    } else if (strcmp(k, "Up") == 0) {
+        sym = XK_Up;
+    } else if (strcmp(k, "Down") == 0) {
+        sym = XK_Down;
     } else {
         char clean_k[64] = {0};
         int j = 0;
@@ -343,6 +351,16 @@ void send_event(Display *dpy, Window w, Atom proto) {
     }
 }
 
+void warp_to_window(Display *dpy, Window root, Window w) {
+    if (w == None || w == root) return;
+    XWindowAttributes wa;
+    if (XGetWindowAttributes(dpy, w, &wa)) {
+        int cx = wa.x + wa.width / 2;
+        int cy = wa.y + wa.height / 2;
+        XWarpPointer(dpy, None, root, 0, 0, 0, 0, cx, cy);
+    }
+}
+
 void set_focus(Display *dpy, Window w) {
     if (focused_window != None && focused_window != DefaultRootWindow(dpy)) {
         XSetWindowBorder(dpy, focused_window, color_border);
@@ -461,6 +479,121 @@ void apply_zoom(Display *dpy, Window root) {
     }
 }
 
+void tile_move(Display *dpy, Window root, int direction) {
+    Window root_ret, parent_ret, *children = NULL;
+    unsigned int nchildren;
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) return;
+
+    Window viewable[256];
+    int v_count = 0;
+    for (unsigned int i = 0; i < nchildren; i++) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+            if (v_count < 256) viewable[v_count++] = children[i];
+        }
+    }
+
+    if (v_count < 2) {
+        if (children) XFree(children);
+        return;
+    }
+
+    int focused_idx = -1;
+    for (int i = 0; i < v_count; i++) {
+        if (viewable[i] == focused_window) {
+            focused_idx = i;
+            break;
+        }
+    }
+
+    if (focused_idx == -1) {
+        if (children) XFree(children);
+        return;
+    }
+
+    int target_idx = focused_idx + direction;
+    if (target_idx < 0 || target_idx >= v_count) {
+        if (children) XFree(children);
+        return;
+    }
+
+    Window winA = viewable[focused_idx];
+    Window winB = viewable[target_idx];
+
+    Window *t2b = malloc(nchildren * sizeof(Window));
+    for (unsigned int i = 0; i < nchildren; i++) {
+        t2b[i] = children[nchildren - 1 - i];
+    }
+
+    int posA = -1, posB = -1;
+    for (unsigned int i = 0; i < nchildren; i++) {
+        if (t2b[i] == winA) posA = i;
+        if (t2b[i] == winB) posB = i;
+    }
+
+    if (posA != -1 && posB != -1) {
+        Window temp = t2b[posA];
+        t2b[posA] = t2b[posB];
+        t2b[posB] = temp;
+        XRestackWindows(dpy, t2b, nchildren);
+    }
+
+    free(t2b);
+    if (children) XFree(children);
+
+    apply_tiling(dpy, root);
+    set_focus(dpy, winA);
+    warp_to_window(dpy, root, winA);
+}
+
+void focus_direction(Display *dpy, Window root, int direction) {
+    Window root_ret, parent_ret, *children = NULL;
+    unsigned int nchildren;
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) return;
+
+    Window viewable[256];
+    int v_count = 0;
+    for (unsigned int i = 0; i < nchildren; i++) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+            if (v_count < 256) viewable[v_count++] = children[i];
+        }
+    }
+
+    if (v_count == 0) {
+        if (children) XFree(children);
+        return;
+    }
+
+    int focused_idx = 0;
+    for (int i = 0; i < v_count; i++) {
+        if (viewable[i] == focused_window) {
+            focused_idx = i;
+            break;
+        }
+    }
+
+    int target_idx = focused_idx + direction;
+    if (target_idx < 0) target_idx = v_count - 1;
+    if (target_idx >= v_count) target_idx = 0;
+
+    Window target_win = viewable[target_idx];
+    set_focus(dpy, target_win);
+    warp_to_window(dpy, root, target_win);
+
+    if (children) XFree(children);
+}
+
+void float_move(Display *dpy, Window root, int dx, int dy) {
+    if (focused_window == None || focused_window == DefaultRootWindow(dpy)) return;
+    WinState *st = get_window_state(focused_window);
+    if (!st) return;
+    st->x += dx;
+    st->y += dy;
+    XMoveWindow(dpy, focused_window, st->x, st->y);
+    warp_to_window(dpy, root, focused_window);
+}
+
 void grab_keys(Display *dpy, Window root) {
     XUngrabKey(dpy, AnyKey, AnyModifier, root);
     
@@ -483,6 +616,20 @@ void grab_buttons(Display *dpy, Window root) {
     XGrabButton(dpy, Button2, Mod4Mask, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(dpy, Button4, Mod4Mask, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
     XGrabButton(dpy, Button5, Mod4Mask, root, True, ButtonPressMask, GrabModeAsync, GrabModeAsync, None, None);
+}
+
+void set_ewmh_wm_name(Display *dpy, Window root) {
+    Atom net_supporting_wm_check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
+    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+
+    Window wm_window = XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0);
+    
+    XChangeProperty(dpy, root, net_supporting_wm_check, XA_WINDOW, 32, PropModeReplace, (unsigned char *)&wm_window, 1);
+    XChangeProperty(dpy, wm_window, net_supporting_wm_check, XA_WINDOW, 32, PropModeReplace, (unsigned char *)&wm_window, 1);
+    XChangeProperty(dpy, wm_window, net_wm_name, utf8_string, 8, PropModeReplace, (unsigned char *)"ghostwm", 7);
+    
+    XChangeProperty(dpy, root, net_wm_name, utf8_string, 8, PropModeReplace, (unsigned char *)"ghostwm", 7);
 }
 
 int x_error_handler(Display *dpy, XErrorEvent *ee) {
@@ -529,6 +676,8 @@ int main(void) {
     XSetErrorHandler(x_error_handler);
 
     root = DefaultRootWindow(dpy);
+    set_ewmh_wm_name(dpy, root);
+
     wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
     wm_delete_window = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
 
@@ -579,6 +728,7 @@ int main(void) {
                     XMapWindow(dpy, ev.xmap.window);
                     XSetWindowBorderWidth(dpy, ev.xmap.window, border_width);
                     set_focus(dpy, ev.xmap.window);
+                    warp_to_window(dpy, root, ev.xmap.window);
 
                     if (is_tiling) {
                         apply_tiling(dpy, root);
@@ -720,6 +870,26 @@ int main(void) {
                             } else if (strcmp(keys[i].cmd, "alt-tab") == 0) {
                                 is_tiling = !is_tiling;
                                 apply_tiling(dpy, root);
+                            } else if (strcmp(keys[i].cmd, "focus-left") == 0) {
+                                focus_direction(dpy, root, -1);
+                            } else if (strcmp(keys[i].cmd, "focus-right") == 0) {
+                                focus_direction(dpy, root, 1);
+                            } else if (strcmp(keys[i].cmd, "focus-up") == 0) {
+                                focus_direction(dpy, root, -1);
+                            } else if (strcmp(keys[i].cmd, "focus-down") == 0) {
+                                focus_direction(dpy, root, 1);
+                            } else if (strcmp(keys[i].cmd, "move-left") == 0) {
+                                if (is_tiling) tile_move(dpy, root, -1);
+                                else float_move(dpy, root, -50, 0);
+                            } else if (strcmp(keys[i].cmd, "move-right") == 0) {
+                                if (is_tiling) tile_move(dpy, root, 1);
+                                else float_move(dpy, root, 50, 0);
+                            } else if (strcmp(keys[i].cmd, "move-up") == 0) {
+                                if (is_tiling) tile_move(dpy, root, -1);
+                                else float_move(dpy, root, 0, -50);
+                            } else if (strcmp(keys[i].cmd, "move-down") == 0) {
+                                if (is_tiling) tile_move(dpy, root, 1);
+                                else float_move(dpy, root, 0, 50);
                             } else if (strcmp(keys[i].cmd, "workspace_1") == 0) {
                                 if (focused_window != None && focused_window != root) {
                                     int dp_x = 0, dp_y = 0;

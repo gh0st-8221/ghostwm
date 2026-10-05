@@ -378,26 +378,75 @@ void toggle_minimize(Display *dpy, Window root, Window w) {
 }
 
 void alt_tab(Display *dpy, Window root) {
-    if (!saved_states) return;
-    WinState *curr = saved_states;
-    WinState *next_win = NULL;
-    while (curr) {
-        if (curr->w == focused_window) {
-            next_win = curr->next;
-            break;
+    Window root_ret, parent_ret, *children = NULL;
+    unsigned int nchildren;
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) return;
+
+    char window_list[4096] = "";
+    int count = 0;
+
+    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+
+    for (unsigned int i = 0; i < nchildren && count < 256; i++) {
+        XWindowAttributes wa;
+        if (XGetWindowAttributes(dpy, children[i], &wa) && wa.map_state == IsViewable && !wa.override_redirect) {
+            char *name = NULL;
+            XTextProperty prop;
+            if (XGetTextProperty(dpy, children[i], &prop, net_wm_name) && prop.value) {
+                name = (char *)prop.value;
+            } else if (XGetWMName(dpy, children[i], &prop) && prop.value) {
+                name = (char *)prop.value;
+            }
+
+            char line[256];
+            snprintf(line, sizeof(line), "%s\n", name ? name : "Unnamed");
+            strncat(window_list, line, sizeof(window_list) - strlen(window_list) - 1);
+            if (name) XFree(prop.value);
+            count++;
         }
-        curr = curr->next;
     }
-    if (!next_win) next_win = saved_states;
-    if (next_win) {
-        if (next_win->is_minimized) {
-            next_win->is_minimized = 0;
-            XMapWindow(dpy, next_win->w);
-            if (is_tiling) apply_tiling(dpy, root);
+    if (children) XFree(children);
+    if (count == 0) return;
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "echo \"%s\" | rofi -dmenu -p \"Windows\"", window_list);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return;
+
+    char selected[256];
+    if (fgets(selected, sizeof(selected), fp)) {
+        selected[strcspn(selected, "\n")] = 0;
+    }
+    pclose(fp);
+
+    if (selected[0] == '\0') return;
+
+    children = NULL;
+    if (XQueryTree(dpy, root, &root_ret, &parent_ret, &children, &nchildren)) {
+        for (unsigned int i = 0; i < nchildren; i++) {
+            char *name = NULL;
+            XTextProperty prop;
+            if (XGetTextProperty(dpy, children[i], &prop, net_wm_name) && prop.value) {
+                name = (char *)prop.value;
+            } else if (XGetWMName(dpy, children[i], &prop) && prop.value) {
+                name = (char *)prop.value;
+            }
+            if (name && strcmp(name, selected) == 0) {
+                if (name) XFree(prop.value);
+                WinState *st = get_window_state(children[i]);
+                if (st && st->is_minimized) {
+                    st->is_minimized = 0;
+                    XMapWindow(dpy, children[i]);
+                    if (is_tiling) apply_tiling(dpy, root);
+                }
+                XRaiseWindow(dpy, children[i]);
+                set_focus(dpy, children[i]);
+                warp_to_window(dpy, root, children[i]);
+                break;
+            }
+            if (name) XFree(prop.value);
         }
-        XRaiseWindow(dpy, next_win->w);
-        set_focus(dpy, next_win->w);
-        warp_to_window(dpy, root, next_win->w);
+        if (children) XFree(children);
     }
 }
 

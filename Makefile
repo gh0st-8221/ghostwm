@@ -1,14 +1,9 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O3
-LIBS = -lX11 -lXrandr
-TARGET = ghostwm
+LIBS = -lX11 -lXrandr -lXcomposite -lXdamage -lXrender -lm
 
-all: $(TARGET)
-
-$(TARGET): ghostwm.c
-	$(CC) $(CFLAGS) ghostwm.c -o $(TARGET) $(LIBS)
+ghostwm: ghostwm.c
+	$(CC) $(CFLAGS) ghostwm.c -o ghostwm $(LIBS)
 
 clean:
-	rm -f $(TARGET)
-
-.PHONY: all clean
+	rm -f ghostwm

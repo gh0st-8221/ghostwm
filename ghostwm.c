@@ -86,6 +86,7 @@ int nws = 4;
 double zoom_min = 0.4;
 char setup_cmd[1024] = "";
 char default_mon[64] = "";
+char order_cfg[256] = "";
 
 struct KeyBinding keys[MAX_KEYS];
 int keys_count = 0;
@@ -200,6 +201,7 @@ static void load_config(void) {
     autostart_count = 0;
     setup_cmd[0] = '\0';
     default_mon[0] = '\0';
+    order_cfg[0] = '\0';
 
     const char *home = getenv("HOME");
     if (!home) {
@@ -256,6 +258,7 @@ static void load_config(void) {
         } else if (!strcmp(section, "monitors") && quoted) {
             if (!strcmp(key, "setup")) snprintf(setup_cmd, sizeof(setup_cmd), "%s", val);
             else if (!strcmp(key, "default")) snprintf(default_mon, sizeof(default_mon), "%.63s", val);
+            else if (!strcmp(key, "order")) snprintf(order_cfg, sizeof(order_cfg), "%.255s", val);
         } else if (!strcmp(section, "autostart") && quoted) {
             if (!strcmp(key, "cmd") && autostart_count < MAX_AUTOSTART) autostart_cmds[autostart_count++] = strdup(val);
         } else if (!strcmp(section, "keys") && quoted) {
@@ -280,10 +283,54 @@ static void run_autostart(void) {
     for (int i = 0; i < autostart_count; i++) spawn(autostart_cmds[i]);
 }
 
+static void arrange_monitors(void) {
+    if (!order_cfg[0]) return;
+    int n = 0;
+    XRRMonitorInfo *xm = XRRGetMonitors(dpy, root, True, &n);
+    if (!xm || n <= 0) {
+        if (xm) XRRFreeMonitors(xm);
+        return;
+    }
+    int idx[MAX_MONITORS], cnt = 0;
+    char used[MAX_MONITORS] = {0};
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", order_cfg);
+    char *save = NULL;
+    for (char *t = strtok_r(buf, " ,", &save); t && cnt < MAX_MONITORS; t = strtok_r(NULL, " ,", &save)) {
+        int w, h;
+        if (sscanf(t, "%dx%d", &w, &h) != 2) continue;
+        for (int i = 0; i < n && i < MAX_MONITORS; i++) {
+            if (!used[i] && xm[i].width == w && xm[i].height == h) {
+                used[i] = 1;
+                idx[cnt++] = i;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < n && i < MAX_MONITORS && cnt < MAX_MONITORS; i++) if (!used[i]) idx[cnt++] = i;
+    int maxh = 0;
+    for (int k = 0; k < cnt; k++) if (xm[idx[k]].height > maxh) maxh = xm[idx[k]].height;
+    char cmd[2048] = "xrandr";
+    size_t len = strlen(cmd);
+    int x = 0;
+    for (int k = 0; k < cnt && len < sizeof(cmd) - 160; k++) {
+        XRRMonitorInfo *mi = &xm[idx[k]];
+        char *nm = XGetAtomName(dpy, mi->name);
+        if (!nm) continue;
+        int w = snprintf(cmd + len, sizeof(cmd) - len, " --output '%.40s' --pos %dx%d", nm, x, (maxh - mi->height) / 2);
+        if (w > 0) len += (size_t)w;
+        x += mi->width;
+        XFree(nm);
+    }
+    XRRFreeMonitors(xm);
+    if (system(cmd) == -1) fprintf(stderr, "ghostwm: monitor arrange failed\n");
+}
+
 static void run_setup(void) {
-    if (!setup_cmd[0]) return;
     signal(SIGCHLD, SIG_DFL);
-    if (system(setup_cmd) == -1) fprintf(stderr, "ghostwm: monitor setup failed\n");
+    if (setup_cmd[0] && system(setup_cmd) == -1) fprintf(stderr, "ghostwm: monitor setup failed\n");
+    XSync(dpy, False);
+    arrange_monitors();
     signal(SIGCHLD, SIG_IGN);
     XSync(dpy, False);
 }
@@ -326,8 +373,14 @@ static int mon_index(Monitor *m) {
     return 0;
 }
 
+static Monitor *neighbor(Monitor *m, int dir);
+
 static Monitor *mon_target(Monitor *from, const char *arg) {
     int i = mon_index(from);
+    if (!strcmp(arg, "left")) return neighbor(from, 0);
+    if (!strcmp(arg, "right")) return neighbor(from, 1);
+    if (!strcmp(arg, "up")) return neighbor(from, 2);
+    if (!strcmp(arg, "down")) return neighbor(from, 3);
     if (!strcmp(arg, "next")) return mons[(i + 1) % nmons];
     if (!strcmp(arg, "prev")) return mons[(i + nmons - 1) % nmons];
     int w, h;
@@ -1547,7 +1600,7 @@ static void process_event(XEvent *ev) {
                 pan_x = pan_start_x = b->x_root;
                 pan_y = pan_start_y = b->y_root;
                 last_move_ms = get_time_ms();
-            } else if (mod1 && !m->overview && !m->tiling && (b->button == Button1 || b->button == Button3)) {
+            } else if (mod1 && !m->overview && (b->button == Button1 || (b->button == Button3 && !m->tiling))) {
                 Client *c = client_at(m, lx, ly);
                 if (c) {
                     View *v = &m->view[m->ws];
@@ -1571,10 +1624,35 @@ static void process_event(XEvent *ev) {
             XButtonEvent *b = &ev->xbutton;
             if (b->button == Button1 && panning) end_pan(b->x_root, b->y_root);
             if (drag_mode && (b->button == Button1 || b->button == Button3)) {
-                Monitor *m = drag_c ? drag_c->mon : NULL;
+                Client *c = drag_c;
+                int was_move = drag_mode == 1;
                 drag_mode = 0;
                 drag_c = NULL;
-                if (m && !m->overview) float_place(m, 1);
+                if (c) {
+                    Monitor *m = c->mon;
+                    Monitor *mp = mon_at(b->x_root, b->y_root);
+                    if (was_move && mp != m) {
+                        client_to_monitor(c, mp);
+                        set_focus(c);
+                        raise_client(c);
+                        m = mp;
+                    } else if (was_move && m->tiling) {
+                        Client *t = client_at(m, b->x_root - m->x, b->y_root - m->y);
+                        if (t && t != c) {
+                            int ia = -1, ib = -1;
+                            for (int i = 0; i < nclients; i++) {
+                                if (clients[i] == c) ia = i;
+                                if (clients[i] == t) ib = i;
+                            }
+                            if (ia >= 0 && ib >= 0) {
+                                clients[ia] = t;
+                                clients[ib] = c;
+                            }
+                        }
+                    }
+                    if (m->tiling) layout(m, 1);
+                    else if (!m->overview) float_place(m, 1);
+                }
             }
             break;
         }

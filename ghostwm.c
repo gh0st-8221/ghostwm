@@ -85,6 +85,7 @@ int default_height = 1080;
 int nws = 4;
 double zoom_min = 0.4;
 char setup_cmd[1024] = "";
+char default_mon[64] = "";
 
 struct KeyBinding keys[MAX_KEYS];
 int keys_count = 0;
@@ -198,6 +199,7 @@ static void load_config(void) {
     for (int i = 0; i < autostart_count; i++) free(autostart_cmds[i]);
     autostart_count = 0;
     setup_cmd[0] = '\0';
+    default_mon[0] = '\0';
 
     const char *home = getenv("HOME");
     if (!home) {
@@ -253,6 +255,7 @@ static void load_config(void) {
             else if (!strcmp(key, "focus")) color_focus = strtoul(val, NULL, 0);
         } else if (!strcmp(section, "monitors") && quoted) {
             if (!strcmp(key, "setup")) snprintf(setup_cmd, sizeof(setup_cmd), "%s", val);
+            else if (!strcmp(key, "default")) snprintf(default_mon, sizeof(default_mon), "%.63s", val);
         } else if (!strcmp(section, "autostart") && quoted) {
             if (!strcmp(key, "cmd") && autostart_count < MAX_AUTOSTART) autostart_cmds[autostart_count++] = strdup(val);
         } else if (!strcmp(section, "keys") && quoted) {
@@ -327,6 +330,12 @@ static Monitor *mon_target(Monitor *from, const char *arg) {
     int i = mon_index(from);
     if (!strcmp(arg, "next")) return mons[(i + 1) % nmons];
     if (!strcmp(arg, "prev")) return mons[(i + nmons - 1) % nmons];
+    int w, h;
+    if (sscanf(arg, "%dx%d", &w, &h) == 2) {
+        for (int k = 0; k < nmons; k++) if (mons[k]->w == w && mons[k]->h == h) return mons[k];
+        return NULL;
+    }
+    for (int k = 0; k < nmons; k++) if (!strcmp(mons[k]->name, arg)) return mons[k];
     int n = atoi(arg);
     if (n >= 1 && n <= nmons) return mons[n - 1];
     return NULL;
@@ -892,14 +901,10 @@ static Client *pick_dir(Client *cur, int dir) {
 }
 
 static void focus_monitor(Monitor *t) {
-    Client *c = fallback_client(t);
-    if (c) {
-        set_focus(c);
-        warp_to(c);
-    } else {
-        set_focus(NULL);
-        XWarpPointer(dpy, None, root, 0, 0, 0, 0, t->x + t->w / 2, t->y + t->h / 2);
-    }
+    XWarpPointer(dpy, None, root, 0, 0, 0, 0, t->x + t->w / 2, t->y + t->h / 2);
+    Client *c = client_at(t, t->w / 2, t->h / 2);
+    if (!c) c = fallback_client(t);
+    set_focus(c);
 }
 
 static Client *current_client(Monitor *m) {
@@ -1696,7 +1701,9 @@ int main(void) {
     grab_keys();
     grab_buttons();
     run_autostart();
-    XWarpPointer(dpy, None, root, 0, 0, 0, 0, mons[0]->x + mons[0]->w / 2, mons[0]->y + mons[0]->h / 2);
+    Monitor *start = default_mon[0] ? mon_target(mons[0], default_mon) : NULL;
+    if (!start) start = mons[0];
+    XWarpPointer(dpy, None, root, 0, 0, 0, 0, start->x + start->w / 2, start->y + start->h / 2);
     XSync(dpy, False);
 
     for (;;) {

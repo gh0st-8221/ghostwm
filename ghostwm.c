@@ -76,7 +76,7 @@ struct KeyBinding {
 };
 
 int border_width = 1;
-unsigned long color_bg = 0x101010;
+unsigned long color_bg = 0x000000;
 unsigned long color_fg = 0xffffff;
 unsigned long color_border = 0x303030;
 unsigned long color_focus = 0x0000ff;

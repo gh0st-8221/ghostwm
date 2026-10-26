@@ -7,6 +7,7 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xrender.h>
+#include <X11/extensions/dpms.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -84,6 +85,7 @@ int default_width = 1920;
 int default_height = 1080;
 int nws = 4;
 double zoom_min = 0.4;
+int sleep_timeout = 0;
 char setup_cmd[1024] = "";
 char default_mon[64] = "";
 char order_cfg[256] = "";
@@ -202,6 +204,7 @@ static void load_config(void) {
     setup_cmd[0] = '\0';
     default_mon[0] = '\0';
     order_cfg[0] = '\0';
+    sleep_timeout = 0;
 
     const char *home = getenv("HOME");
     if (!home) {
@@ -250,6 +253,7 @@ static void load_config(void) {
             else if (!strcmp(key, "default_height")) default_height = clampi(atoi(val), 100, 16000);
             else if (!strcmp(key, "workspaces")) nws = clampi(atoi(val), 1, MAX_WS);
             else if (!strcmp(key, "zoom_min")) zoom_min = clampd(atof(val), 0.15, 0.95);
+            else if (!strcmp(key, "sleep_timeout")) sleep_timeout = clampi(atoi(val), 0, 86400);
         } else if (!strcmp(section, "colors") && quoted) {
             if (!strcmp(key, "bg")) color_bg = strtoul(val, NULL, 0);
             else if (!strcmp(key, "fg")) color_fg = strtoul(val, NULL, 0);
@@ -1316,6 +1320,18 @@ static void grab_buttons(void) {
     grab_button_all(Button5, Mod4Mask, ButtonPressMask);
 }
 
+static void apply_power(void) {
+    int ev, er;
+    XSetScreenSaver(dpy, 0, 0, DontPreferBlanking, DefaultExposures);
+    if (!DPMSQueryExtension(dpy, &ev, &er) || !DPMSCapable(dpy)) return;
+    if (sleep_timeout <= 0) {
+        DPMSDisable(dpy);
+        return;
+    }
+    DPMSSetTimeouts(dpy, 0, 0, (CARD16)sleep_timeout);
+    DPMSEnable(dpy);
+}
+
 static void set_ewmh(void) {
     Atom check = XInternAtom(dpy, "_NET_SUPPORTING_WM_CHECK", False);
     Atom supported = XInternAtom(dpy, "_NET_SUPPORTED", False);
@@ -1774,6 +1790,7 @@ int main(void) {
     XClearWindow(dpy, root);
     XDefineCursor(dpy, root, XCreateFontCursor(dpy, XC_dot));
     set_ewmh();
+    apply_power();
 
     refresh_monitors();
     grab_keys();
@@ -1791,6 +1808,7 @@ int main(void) {
             run_setup();
             refresh_monitors();
             apply_config_to_state();
+            apply_power();
             grab_keys();
             run_autostart();
         }

@@ -4,8 +4,8 @@ BINDIR  = $(DESTDIR)$(PREFIX)/bin
 SHAREDIR = $(DESTDIR)$(PREFIX)/share
 XSESS   = $(DESTDIR)/usr/share/xsessions
 CFLAGS  ?= -O2
-CFLAGS  += -Wall -Wextra $(shell pkg-config --cflags x11 xrandr xcomposite xdamage xrender)
-LDLIBS  = $(shell pkg-config --libs x11 xrandr xcomposite xdamage xrender) -lm
+CFLAGS  += -Wall -Wextra $(shell pkg-config --cflags x11 xext xrandr xcomposite xdamage xrender)
+LDLIBS  = $(shell pkg-config --libs x11 xext xrandr xcomposite xdamage xrender) -lm
 
 all: ghostwm
 

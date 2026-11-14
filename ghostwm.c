@@ -4,9 +4,6 @@
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <X11/extensions/Xrandr.h>
-#include <X11/extensions/Xcomposite.h>
-#include <X11/extensions/Xdamage.h>
-#include <X11/extensions/Xrender.h>
 #include <X11/extensions/dpms.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,23 +19,17 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
-#define MAX_VELOCITY 1500.0
 #define MAX_KEYS 256
 #define MAX_AUTOSTART 64
 #define MAX_CLIENTS 1024
 #define MAX_MONITORS 32
 #define MAX_WS 9
 #define MENU_ITEMS 256
-#define PARK 30000
 #define PL_MOVE 0
 #define PL_FULL 3
 
 typedef struct Monitor Monitor;
 typedef struct Client Client;
-
-typedef struct {
-    double cx, cy, zoom;
-} View;
 
 struct Client {
     Window w;
@@ -46,23 +37,16 @@ struct Client {
     int ws;
     int fx, fy, fw, fh;
     int gx, gy, gw, gh;
-    int fullscreen, minimized, mapped, ignore_unmap, redir;
+    int fullscreen, minimized, mapped, ignore_unmap;
     unsigned long z, last_focus;
-    Damage damage;
-    Pixmap named;
-    Picture pic;
-    Visual *visual;
 };
 
 struct Monitor {
     char name[64];
     int x, y, w, h;
-    Window box, veil;
-    int ws, tiling, overview, dirty;
-    View view[MAX_WS];
+    Window box;
+    int ws, tiling;
     Client *sel[MAX_WS];
-    Pixmap back;
-    Picture back_pic, veil_pic;
 };
 
 typedef struct {
@@ -84,7 +68,6 @@ unsigned long color_focus = 0x0000ff;
 int default_width = 1920;
 int default_height = 1080;
 int nws = 4;
-double zoom_min = 0.4;
 int sleep_timeout = 0;
 char setup_cmd[1024] = "";
 char default_mon[64] = "";
@@ -99,7 +82,7 @@ Display *dpy;
 Window root;
 int screen;
 Atom wm_delete_window, wm_protocols, net_wm_name, utf8_string, net_wm_state, net_wm_fullscreen;
-int damage_event_base, rr_event_base, have_composite;
+int rr_event_base;
 
 Client *clients[MAX_CLIENTS];
 int nclients = 0;
@@ -110,13 +93,7 @@ unsigned long zcounter = 0, focus_counter = 0;
 
 volatile sig_atomic_t reload_requested = 0;
 
-int panning = 0, pan_select = 0, pan_moved = 0;
-Monitor *pan_mon = NULL, *inertia_mon = NULL;
-int pan_x, pan_y, pan_start_x, pan_start_y;
-double vel_x = 0.0, vel_y = 0.0, last_move_ms = 0.0, last_tick_ms = 0.0, last_paint_ms = 0.0;
-
-int drag_mode = 0, drag_px, drag_py, drag_fx, drag_fy, drag_fw, drag_fh;
-double drag_ox, drag_oy;
+int drag_mode = 0, drag_px, drag_py, drag_fx, drag_fy, drag_fw, drag_fh, drag_ox, drag_oy;
 Client *drag_c = NULL;
 
 pid_t menu_pid = 0;
@@ -130,8 +107,6 @@ static void layout(Monitor *m, int full);
 static void set_focus(Client *c);
 static void activate(Client *c);
 static void switch_ws(Monitor *m, int n);
-static void overview_begin(Monitor *m);
-static void overview_end(Monitor *m);
 static void set_fullscreen(Client *c, int on);
 static void client_to_monitor(Client *c, Monitor *t);
 static void unmanage(Client *c, int destroyed);
@@ -144,20 +119,6 @@ void handle_sigusr1(int sig) {
 static int clampi(int v, int lo, int hi) {
     if (hi < lo) hi = lo;
     return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static double clampd(double v, double lo, double hi) {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-static int fixi(double v) {
-    return clampi((int)lround(v), -PARK, PARK);
-}
-
-static double get_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
 static char *trim(char *s) {
@@ -252,7 +213,6 @@ static void load_config(void) {
             else if (!strcmp(key, "default_width")) default_width = clampi(atoi(val), 100, 16000);
             else if (!strcmp(key, "default_height")) default_height = clampi(atoi(val), 100, 16000);
             else if (!strcmp(key, "workspaces")) nws = clampi(atoi(val), 1, MAX_WS);
-            else if (!strcmp(key, "zoom_min")) zoom_min = clampd(atof(val), 0.15, 0.95);
             else if (!strcmp(key, "sleep_timeout")) sleep_timeout = clampi(atoi(val), 0, 86400);
         } else if (!strcmp(section, "colors") && quoted) {
             if (!strcmp(key, "bg")) color_bg = strtoul(val, NULL, 0);
@@ -430,14 +390,6 @@ static int should_show(Client *c) {
     return c->ws == c->mon->ws && !c->minimized;
 }
 
-static int has_fullscreen(Monitor *m) {
-    for (int i = 0; i < nclients; i++) {
-        Client *c = clients[i];
-        if (c->mon == m && c->fullscreen && should_show(c)) return 1;
-    }
-    return 0;
-}
-
 static Client *fallback_client(Monitor *m) {
     Client *s = m->sel[m->ws];
     if (s && s->mon == m && should_show(s)) return s;
@@ -466,40 +418,10 @@ static void send_configure(Client *c) {
     XSendEvent(dpy, c->w, False, StructureNotifyMask, (XEvent *)&ce);
 }
 
-static void client_drop_pixmap(Client *c) {
-    if (c->pic) {
-        XRenderFreePicture(dpy, c->pic);
-        c->pic = None;
-    }
-    if (c->named) {
-        XFreePixmap(dpy, c->named);
-        c->named = None;
-    }
-}
-
-static void client_redirect(Client *c) {
-    if (c->redir || !have_composite) return;
-    XCompositeRedirectWindow(dpy, c->w, CompositeRedirectManual);
-    c->damage = XDamageCreate(dpy, c->w, XDamageReportNonEmpty);
-    c->redir = 1;
-}
-
-static void client_unredirect(Client *c) {
-    if (!c->redir) return;
-    client_drop_pixmap(c);
-    if (c->damage) {
-        XDamageDestroy(dpy, c->damage);
-        c->damage = None;
-    }
-    XCompositeUnredirectWindow(dpy, c->w, CompositeRedirectManual);
-    c->redir = 0;
-}
-
 static void place(Client *c, int flags) {
     if (c->gw < 1) c->gw = 1;
     if (c->gh < 1) c->gh = 1;
     if (flags & 1) {
-        if (c->redir) client_drop_pixmap(c);
         XMoveResizeWindow(dpy, c->w, c->gx, c->gy, c->gw, c->gh);
     } else {
         XMoveWindow(dpy, c->w, c->gx, c->gy);
@@ -516,7 +438,6 @@ static void sync_visibility(Monitor *m, int show_pass) {
             XMapWindow(dpy, c->w);
             c->mapped = 1;
         } else if (!show_pass && !want && c->mapped) {
-            client_unredirect(c);
             c->ignore_unmap++;
             XUnmapWindow(dpy, c->w);
             c->mapped = 0;
@@ -525,10 +446,8 @@ static void sync_visibility(Monitor *m, int show_pass) {
 }
 
 static void float_update(Client *c, int flags) {
-    Monitor *m = c->mon;
-    View *v = &m->view[c->ws];
-    c->gx = fixi(m->w / 2.0 + (c->fx - v->cx));
-    c->gy = fixi(m->h / 2.0 + (c->fy - v->cy));
+    c->gx = c->fx;
+    c->gy = c->fy;
     c->gw = c->fw;
     c->gh = c->fh;
     place(c, flags);
@@ -584,139 +503,19 @@ static void place_fullscreen(Monitor *m) {
     }
 }
 
-static void overview_sync(Monitor *m) {
-    for (int i = 0; i < nclients; i++) {
-        Client *c = clients[i];
-        if (c->mon != m || !c->mapped || c->redir) continue;
-        client_redirect(c);
-        c->gx = 0;
-        c->gy = 0;
-        c->gw = c->fw;
-        c->gh = c->fh;
-        place(c, 1);
-    }
-}
-
-static void overview_begin(Monitor *m) {
-    if (m->overview || !have_composite) return;
-    XRenderPictFormat *fmt = XRenderFindVisualFormat(dpy, DefaultVisual(dpy, screen));
-    if (!fmt) return;
-    m->overview = 1;
-    m->back = XCreatePixmap(dpy, root, m->w, m->h, DefaultDepth(dpy, screen));
-    m->back_pic = XRenderCreatePicture(dpy, m->back, fmt, 0, NULL);
-    m->veil_pic = XRenderCreatePicture(dpy, m->veil, fmt, 0, NULL);
-    overview_sync(m);
-    XMoveResizeWindow(dpy, m->veil, m->x, m->y, m->w, m->h);
-    XMapRaised(dpy, m->veil);
-    m->dirty = 1;
-}
-
-static void overview_end(Monitor *m) {
-    if (!m->overview) return;
-    m->overview = 0;
-    m->dirty = 0;
-    for (int i = 0; i < nclients; i++) if (clients[i]->mon == m) client_unredirect(clients[i]);
-    XUnmapWindow(dpy, m->veil);
-    if (m->veil_pic) XRenderFreePicture(dpy, m->veil_pic);
-    if (m->back_pic) XRenderFreePicture(dpy, m->back_pic);
-    if (m->back) XFreePixmap(dpy, m->back);
-    m->veil_pic = None;
-    m->back_pic = None;
-    m->back = None;
-}
-
 static void layout(Monitor *m, int full) {
     sync_visibility(m, 0);
-    if (m->tiling) {
-        m->view[m->ws].zoom = 1.0;
-        if (m->overview) overview_end(m);
-        tile(m);
-        place_fullscreen(m);
-        sync_visibility(m, 1);
-        return;
-    }
-    View *v = &m->view[m->ws];
-    if (v->zoom < 1.0 && !has_fullscreen(m) && have_composite) {
-        sync_visibility(m, 1);
-        if (!m->overview) overview_begin(m);
-        else overview_sync(m);
-        m->dirty = 1;
-        return;
-    }
-    v->zoom = 1.0;
-    if (m->overview) overview_end(m);
-    float_place(m, full);
+    if (m->tiling) tile(m);
+    else float_place(m, full);
     place_fullscreen(m);
     sync_visibility(m, 1);
-}
-
-static void paint(Monitor *m) {
-    if (!m->overview) return;
-    View *v = &m->view[m->ws];
-    double z = v->zoom;
-    XRenderColor bg;
-    bg.red = (unsigned short)(((color_bg >> 16) & 0xff) * 257);
-    bg.green = (unsigned short)(((color_bg >> 8) & 0xff) * 257);
-    bg.blue = (unsigned short)((color_bg & 0xff) * 257);
-    bg.alpha = 0xffff;
-    XRenderFillRectangle(dpy, PictOpSrc, m->back_pic, &bg, 0, 0, m->w, m->h);
-
-    Client *order[MAX_CLIENTS];
-    int n = 0;
-    for (int i = 0; i < nclients; i++) {
-        Client *c = clients[i];
-        if (c->mon == m && c->mapped && c->redir) order[n++] = c;
-    }
-    for (int i = 1; i < n; i++) {
-        Client *k = order[i];
-        int j = i - 1;
-        while (j >= 0 && order[j]->z > k->z) {
-            order[j + 1] = order[j];
-            j--;
-        }
-        order[j + 1] = k;
-    }
-
-    XTransform xf;
-    memset(&xf, 0, sizeof(xf));
-    xf.matrix[0][0] = XDoubleToFixed(1.0 / z);
-    xf.matrix[1][1] = XDoubleToFixed(1.0 / z);
-    xf.matrix[2][2] = XDoubleToFixed(1.0);
-
-    for (int i = 0; i < n; i++) {
-        Client *c = order[i];
-        if (!c->named) {
-            XRenderPictFormat *f = XRenderFindVisualFormat(dpy, c->visual);
-            if (!f) continue;
-            c->named = XCompositeNameWindowPixmap(dpy, c->w);
-            c->pic = XRenderCreatePicture(dpy, c->named, f, 0, NULL);
-        }
-        int dx = (int)lround(m->w / 2.0 + (c->fx - v->cx) * z);
-        int dy = (int)lround(m->h / 2.0 + (c->fy - v->cy) * z);
-        int dw = (int)lround((c->fw + 2 * border_width) * z);
-        int dh = (int)lround((c->fh + 2 * border_width) * z);
-        if (dw < 1) dw = 1;
-        if (dh < 1) dh = 1;
-        if (dx >= m->w || dy >= m->h || dx + dw <= 0 || dy + dh <= 0) continue;
-        XRenderSetPictureTransform(dpy, c->pic, &xf);
-        XRenderSetPictureFilter(dpy, c->pic, FilterBilinear, NULL, 0);
-        XRenderComposite(dpy, PictOpOver, c->pic, None, m->back_pic, 0, 0, 0, 0, dx, dy, dw, dh);
-    }
-    XRenderComposite(dpy, PictOpSrc, m->back_pic, None, m->veil_pic, 0, 0, 0, 0, 0, 0, m->w, m->h);
-    m->dirty = 0;
 }
 
 static void client_center(Client *c, int *px, int *py) {
     Monitor *m = c->mon;
     double bw2 = c->fullscreen ? 0 : 2.0 * border_width;
-    if (m->overview) {
-        View *v = &m->view[m->ws];
-        *px = (int)lround(m->x + m->w / 2.0 + (c->fx + (c->fw + bw2) / 2.0 - v->cx) * v->zoom);
-        *py = (int)lround(m->y + m->h / 2.0 + (c->fy + (c->fh + bw2) / 2.0 - v->cy) * v->zoom);
-    } else {
-        *px = m->x + c->gx + (int)((c->gw + bw2) / 2.0);
-        *py = m->y + c->gy + (int)((c->gh + bw2) / 2.0);
-    }
+    *px = m->x + c->gx + (int)((c->gw + bw2) / 2.0);
+    *py = m->y + c->gy + (int)((c->gh + bw2) / 2.0);
 }
 
 static void warp_to(Client *c) {
@@ -728,23 +527,11 @@ static void warp_to(Client *c) {
 
 static Client *client_at(Monitor *m, int sx, int sy) {
     Client *best = NULL;
-    View *v = &m->view[m->ws];
     for (int i = 0; i < nclients; i++) {
         Client *c = clients[i];
         if (c->mon != m || !c->mapped || !should_show(c)) continue;
         double bw2 = c->fullscreen ? 0 : 2.0 * border_width;
-        double x, y, w, h;
-        if (m->overview) {
-            x = m->w / 2.0 + (c->fx - v->cx) * v->zoom;
-            y = m->h / 2.0 + (c->fy - v->cy) * v->zoom;
-            w = (c->fw + bw2) * v->zoom;
-            h = (c->fh + bw2) * v->zoom;
-        } else {
-            x = c->gx;
-            y = c->gy;
-            w = c->gw + bw2;
-            h = c->gh + bw2;
-        }
+        double x = c->gx, y = c->gy, w = c->gw + bw2, h = c->gh + bw2;
         if (sx >= x && sx < x + w && sy >= y && sy < y + h && (!best || c->z > best->z)) best = c;
     }
     return best;
@@ -753,20 +540,6 @@ static Client *client_at(Monitor *m, int sx, int sy) {
 static void raise_client(Client *c) {
     c->z = ++zcounter;
     if (c->mapped) XRaiseWindow(dpy, c->w);
-}
-
-static void reveal(Client *c) {
-    Monitor *m = c->mon;
-    if (m->tiling || c->fullscreen || c->ws != m->ws) return;
-    View *v = &m->view[m->ws];
-    double vw = m->w / v->zoom, vh = m->h / v->zoom;
-    double l = v->cx - vw / 2.0, t = v->cy - vh / 2.0;
-    double cw = c->fw + 2.0 * border_width, ch = c->fh + 2.0 * border_width;
-    if (c->fx < l || c->fy < t || c->fx + cw > l + vw || c->fy + ch > t + vh) {
-        v->cx = c->fx + cw / 2.0;
-        v->cy = c->fy + ch / 2.0;
-        layout(m, 1);
-    }
 }
 
 static void set_focus(Client *c) {
@@ -790,7 +563,6 @@ static void set_fullscreen(Client *c, int on) {
     Monitor *m = c->mon;
     c->fullscreen = on;
     if (on) {
-        m->view[c->ws].zoom = 1.0;
         XSetWindowBorderWidth(dpy, c->w, 0);
         XChangeProperty(dpy, c->w, net_wm_state, XA_ATOM, 32, PropModeReplace, (unsigned char *)&net_wm_fullscreen, 1);
     } else {
@@ -810,13 +582,11 @@ static void activate(Client *c) {
     }
     set_focus(c);
     raise_client(c);
-    reveal(c);
     warp_to(c);
 }
 
 static void switch_ws(Monitor *m, int n) {
     if (n < 0 || n >= nws || m->ws == n) return;
-    if (m->overview) overview_end(m);
     m->ws = n;
     layout(m, 1);
     Client *t = fallback_client(m);
@@ -853,11 +623,6 @@ static void move_to_end(Client *c) {
 static void client_to_monitor(Client *c, Monitor *t) {
     Monitor *s = c->mon;
     if (s == t) return;
-    if (t->overview) {
-        t->view[t->ws].zoom = 1.0;
-        overview_end(t);
-    }
-    client_unredirect(c);
     if (c->fullscreen) {
         c->fullscreen = 0;
         XSetWindowBorderWidth(dpy, c->w, border_width);
@@ -871,63 +636,17 @@ static void client_to_monitor(Client *c, Monitor *t) {
     c->minimized = 0;
     c->fw = clampi(c->fw, 1, t->w - 2 * border_width);
     c->fh = clampi(c->fh, 1, t->h - 2 * border_width);
-    View *v = &t->view[t->ws];
-    c->fx = (int)lround(v->cx - (c->fw + 2.0 * border_width) / 2.0);
-    c->fy = (int)lround(v->cy - (c->fh + 2.0 * border_width) / 2.0);
+    c->fx = clampi((t->w - c->fw - 2 * border_width) / 2, 0, t->w);
+    c->fy = clampi((t->h - c->fh - 2 * border_width) / 2, 0, t->h);
     c->z = ++zcounter;
     move_to_end(c);
     layout(s, 1);
     layout(t, 1);
-    if (s->overview) s->dirty = 1;
-}
-
-static void set_zoom(Monitor *m, double z, int ax, int ay) {
-    if (m->tiling || !have_composite || has_fullscreen(m)) return;
-    View *v = &m->view[m->ws];
-    z = clampd(z, zoom_min, 1.0);
-    if (z > 0.995) z = 1.0;
-    if (z == v->zoom) return;
-    double wx = v->cx + (ax - m->w / 2.0) / v->zoom;
-    double wy = v->cy + (ay - m->h / 2.0) / v->zoom;
-    v->zoom = z;
-    v->cx = wx - (ax - m->w / 2.0) / z;
-    v->cy = wy - (ay - m->h / 2.0) / z;
-    layout(m, 1);
-}
-
-static void zoom_step(Monitor *m, double f, int ax, int ay) {
-    if (ax < 0) ax = m->w / 2;
-    if (ay < 0) ay = m->h / 2;
-    set_zoom(m, m->view[m->ws].zoom * f, ax, ay);
-}
-
-static void pan_apply(Monitor *m, double dx, double dy) {
-    View *v = &m->view[m->ws];
-    v->cx -= dx / v->zoom;
-    v->cy -= dy / v->zoom;
-    if (m->overview) m->dirty = 1;
-    else float_place(m, 0);
-}
-
-static void zoom_to_client(Client *c) {
-    Monitor *m = c->mon;
-    View *v = &m->view[m->ws];
-    v->zoom = 1.0;
-    v->cx = c->fx + (c->fw + 2.0 * border_width) / 2.0;
-    v->cy = c->fy + (c->fh + 2.0 * border_width) / 2.0;
-    layout(m, 1);
-    set_focus(c);
-    raise_client(c);
-    warp_to(c);
 }
 
 static void lrect(Client *c, double *x, double *y, double *w, double *h) {
     double bw2 = c->fullscreen ? 0 : 2.0 * border_width;
-    if (c->mon->tiling || c->fullscreen) {
-        *x = c->gx; *y = c->gy; *w = c->gw + bw2; *h = c->gh + bw2;
-    } else {
-        *x = c->fx; *y = c->fy; *w = c->fw + bw2; *h = c->fh + bw2;
-    }
+    *x = c->gx; *y = c->gy; *w = c->gw + bw2; *h = c->gh + bw2;
 }
 
 static Client *pick_dir(Client *cur, int dir) {
@@ -1010,11 +729,13 @@ static void move_dir(int dir) {
             }
         }
     } else {
-        double step = 50.0 / m->view[m->ws].zoom;
-        if (dir == 0) c->fx -= (int)step;
-        else if (dir == 1) c->fx += (int)step;
-        else if (dir == 2) c->fy -= (int)step;
-        else c->fy += (int)step;
+        int bw2 = 2 * border_width;
+        if (dir == 0) c->fx -= 50;
+        else if (dir == 1) c->fx += 50;
+        else if (dir == 2) c->fy -= 50;
+        else c->fy += 50;
+        c->fx = clampi(c->fx, 0, m->w - c->fw - bw2);
+        c->fy = clampi(c->fy, 0, m->h - c->fh - bw2);
         layout(m, 1);
         warp_to(c);
     }
@@ -1022,7 +743,6 @@ static void move_dir(int dir) {
 
 static void toggle_tiling(Monitor *m) {
     m->tiling = !m->tiling;
-    if (m->tiling) m->view[m->ws].zoom = 1.0;
     layout(m, 1);
     Client *c = current_client(m);
     if (c) {
@@ -1167,7 +887,6 @@ static void menu_poll_result(void) {
 static void unmanage(Client *c, int destroyed) {
     Monitor *m = c->mon;
     int was_focused = focused == c;
-    client_unredirect(c);
     if (!destroyed) {
         XSelectInput(dpy, c->w, NoEventMask);
         XSetWindowBorderWidth(dpy, c->w, 0);
@@ -1187,7 +906,6 @@ static void unmanage(Client *c, int destroyed) {
     }
     free(c);
     layout(m, 1);
-    if (m->overview) m->dirty = 1;
     if (was_focused) {
         Client *n = fallback_client(m);
         set_focus(n);
@@ -1203,23 +921,17 @@ static void manage(Window w) {
         return;
     }
     Monitor *m = cur_mon();
-    View *v = &m->view[m->ws];
-    if (m->overview) {
-        v->zoom = 1.0;
-        overview_end(m);
-    }
     Client *c = calloc(1, sizeof(Client));
     if (!c) return;
     c->w = w;
     c->mon = m;
     c->ws = m->ws;
-    c->visual = wa.visual;
     c->fw = clampi(default_width, 1, m->w - 2 * border_width);
     c->fh = clampi(default_height, 1, m->h - 2 * border_width);
     int px, py;
     pointer_pos(&px, &py);
-    c->fx = (int)lround(v->cx + (px - m->x - m->w / 2.0) - (c->fw + 2.0 * border_width) / 2.0);
-    c->fy = (int)lround(v->cy + (py - m->y - m->h / 2.0) - (c->fh + 2.0 * border_width) / 2.0);
+    c->fx = clampi(px - m->x - (c->fw + 2 * border_width) / 2, 0, m->w - c->fw - 2 * border_width);
+    c->fy = clampi(py - m->y - (c->fh + 2 * border_width) / 2, 0, m->h - c->fh - 2 * border_width);
     c->z = ++zcounter;
     clients[nclients++] = c;
     XSelectInput(dpy, w, EnterWindowMask | FocusChangeMask | StructureNotifyMask);
@@ -1265,12 +977,6 @@ static void exec_command(const char *cmd) {
         move_dir(2);
     } else if (!strcmp(cmd, "move-down")) {
         move_dir(3);
-    } else if (!strcmp(cmd, "zoom-in")) {
-        zoom_step(m, 1.15, -1, -1);
-    } else if (!strcmp(cmd, "zoom-out")) {
-        zoom_step(m, 1.0 / 1.15, -1, -1);
-    } else if (!strcmp(cmd, "zoom-reset")) {
-        set_zoom(m, 1.0, m->w / 2, m->h / 2);
     } else if (!strncmp(cmd, "workspace ", 10)) {
         n = atoi(cmd + 10);
         switch_ws(m, n - 1);
@@ -1314,10 +1020,6 @@ static void grab_buttons(void) {
     unsigned int full = ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
     grab_button_all(Button1, Mod1Mask, full);
     grab_button_all(Button3, Mod1Mask, full);
-    grab_button_all(Button1, Mod4Mask, full);
-    grab_button_all(Button2, Mod4Mask, ButtonPressMask);
-    grab_button_all(Button4, Mod4Mask, ButtonPressMask);
-    grab_button_all(Button5, Mod4Mask, ButtonPressMask);
 }
 
 static void apply_power(void) {
@@ -1360,32 +1062,14 @@ static Monitor *create_monitor(const MonInfo *mi) {
     m->w = mi->w;
     m->h = mi->h;
     m->tiling = 1;
-    for (int k = 0; k < MAX_WS; k++) m->view[k].zoom = 1.0;
     m->box = XCreateSimpleWindow(dpy, root, m->x, m->y, m->w, m->h, 0, 0, color_bg);
     XSelectInput(dpy, m->box, SubstructureRedirectMask | SubstructureNotifyMask);
-    XSetWindowAttributes sa;
-    sa.override_redirect = True;
-    sa.background_pixel = color_bg;
-    sa.event_mask = ButtonPressMask | ButtonReleaseMask | ButtonMotionMask | ExposureMask;
-    m->veil = XCreateWindow(dpy, root, m->x, m->y, m->w, m->h, 0, CopyFromParent, InputOutput, CopyFromParent,
-                            CWOverrideRedirect | CWBackPixel | CWEventMask, &sa);
     XMapWindow(dpy, m->box);
     XLowerWindow(dpy, m->box);
     return m;
 }
 
 static void destroy_monitor(Monitor *m) {
-    overview_end(m);
-    if (pan_mon == m) {
-        pan_mon = NULL;
-        panning = 0;
-    }
-    if (inertia_mon == m) {
-        inertia_mon = NULL;
-        vel_x = 0;
-        vel_y = 0;
-    }
-    XDestroyWindow(dpy, m->veil);
     XDestroyWindow(dpy, m->box);
     free(m);
 }
@@ -1439,7 +1123,6 @@ static void refresh_monitors(void) {
         }
         if (m) {
             if (m->x != info[i].x || m->y != info[i].y || m->w != info[i].w || m->h != info[i].h) {
-                overview_end(m);
                 m->x = info[i].x;
                 m->y = info[i].y;
                 m->w = info[i].w;
@@ -1472,7 +1155,6 @@ static void apply_config_to_state(void) {
         Monitor *m = mons[i];
         if (m->ws >= nws) m->ws = nws - 1;
         XSetWindowBackground(dpy, m->box, color_bg);
-        XSetWindowBackground(dpy, m->veil, color_bg);
         XClearWindow(dpy, m->box);
     }
     for (int i = 0; i < nclients; i++) {
@@ -1484,41 +1166,7 @@ static void apply_config_to_state(void) {
     for (int i = 0; i < nmons; i++) layout(mons[i], 1);
 }
 
-static void end_pan(int rx, int ry) {
-    Monitor *m = pan_mon;
-    panning = 0;
-    if (!m) return;
-    if (pan_select && !pan_moved) {
-        vel_x = 0;
-        vel_y = 0;
-        Client *c = client_at(m, rx - m->x, ry - m->y);
-        if (c) zoom_to_client(c);
-        return;
-    }
-    if (get_time_ms() - last_move_ms > 60.0) {
-        vel_x = 0;
-        vel_y = 0;
-    }
-    vel_x = clampd(vel_x, -MAX_VELOCITY, MAX_VELOCITY);
-    vel_y = clampd(vel_y, -MAX_VELOCITY, MAX_VELOCITY);
-    inertia_mon = m;
-    last_tick_ms = get_time_ms();
-    if (fabs(vel_x) < 8.0 && fabs(vel_y) < 8.0) {
-        vel_x = 0;
-        vel_y = 0;
-        if (!m->overview) float_place(m, 1);
-    }
-}
-
 static void process_event(XEvent *ev) {
-    if (have_composite && ev->type == damage_event_base + XDamageNotify) {
-        XDamageNotifyEvent *de = (XDamageNotifyEvent *)ev;
-        XDamageSubtract(dpy, de->damage, None, None);
-        for (int i = 0; i < nclients; i++) {
-            if (clients[i]->damage == de->damage) clients[i]->mon->dirty = 1;
-        }
-        return;
-    }
     if (ev->type == rr_event_base + RRScreenChangeNotify) {
         XRRUpdateConfiguration(ev);
         refresh_monitors();
@@ -1581,10 +1229,6 @@ static void process_event(XEvent *ev) {
             if (c && c != focused && c->mapped && should_show(c)) set_focus(c);
             break;
         }
-        case Expose: {
-            for (int i = 0; i < nmons; i++) if (mons[i]->veil == ev->xexpose.window) mons[i]->dirty = 1;
-            break;
-        }
         case ClientMessage: {
             XClientMessageEvent *e = &ev->xclient;
             if (e->message_type != net_wm_state) break;
@@ -1601,25 +1245,10 @@ static void process_event(XEvent *ev) {
             XButtonEvent *b = &ev->xbutton;
             Monitor *m = mon_at(b->x_root, b->y_root);
             int lx = b->x_root - m->x, ly = b->y_root - m->y;
-            int mod4 = (b->state & Mod4Mask) != 0, mod1 = (b->state & Mod1Mask) != 0;
-            vel_x = 0;
-            vel_y = 0;
-            if (b->button == Button4 || b->button == Button5) {
-                if (mod4 || m->overview) zoom_step(m, b->button == Button4 ? 1.12 : 1.0 / 1.12, lx, ly);
-            } else if (b->button == Button2) {
-                if (mod4) set_zoom(m, 1.0, lx, ly);
-            } else if (b->button == Button1 && (mod4 || m->overview) && !m->tiling) {
-                panning = 1;
-                pan_mon = m;
-                pan_select = m->overview && !mod4;
-                pan_moved = 0;
-                pan_x = pan_start_x = b->x_root;
-                pan_y = pan_start_y = b->y_root;
-                last_move_ms = get_time_ms();
-            } else if (mod1 && !m->overview && (b->button == Button1 || (b->button == Button3 && !m->tiling))) {
+            int mod1 = (b->state & Mod1Mask) != 0;
+            if (mod1 && (b->button == Button1 || (b->button == Button3 && !m->tiling))) {
                 Client *c = client_at(m, lx, ly);
                 if (c) {
-                    View *v = &m->view[m->ws];
                     set_focus(c);
                     raise_client(c);
                     drag_c = c;
@@ -1630,15 +1259,14 @@ static void process_event(XEvent *ev) {
                     drag_fy = c->fy;
                     drag_fw = c->fw;
                     drag_fh = c->fh;
-                    drag_ox = v->cx + (lx - m->w / 2.0) - c->fx;
-                    drag_oy = v->cy + (ly - m->h / 2.0) - c->fy;
+                    drag_ox = lx - c->gx;
+                    drag_oy = ly - c->gy;
                 }
             }
             break;
         }
         case ButtonRelease: {
             XButtonEvent *b = &ev->xbutton;
-            if (b->button == Button1 && panning) end_pan(b->x_root, b->y_root);
             if (drag_mode && (b->button == Button1 || b->button == Button3)) {
                 Client *c = drag_c;
                 int was_move = drag_mode == 1;
@@ -1666,8 +1294,7 @@ static void process_event(XEvent *ev) {
                             }
                         }
                     }
-                    if (m->tiling) layout(m, 1);
-                    else if (!m->overview) float_place(m, 1);
+                    layout(m, 1);
                 }
             }
             break;
@@ -1676,22 +1303,7 @@ static void process_event(XEvent *ev) {
             while (XCheckTypedEvent(dpy, MotionNotify, ev)) {
             }
             int rx = ev->xmotion.x_root, ry = ev->xmotion.y_root;
-            if (panning && pan_mon) {
-                int dx = rx - pan_x, dy = ry - pan_y;
-                if (dx || dy) {
-                    double now = get_time_ms();
-                    double dt = now - last_move_ms;
-                    if (dt > 0.5) {
-                        vel_x = 0.5 * vel_x + 0.5 * (dx / (dt / 1000.0));
-                        vel_y = 0.5 * vel_y + 0.5 * (dy / (dt / 1000.0));
-                    }
-                    last_move_ms = now;
-                    pan_x = rx;
-                    pan_y = ry;
-                    if (abs(rx - pan_start_x) + abs(ry - pan_start_y) > 5) pan_moved = 1;
-                    pan_apply(pan_mon, dx, dy);
-                }
-            } else if (drag_mode && drag_c) {
+            if (drag_mode && drag_c) {
                 Client *c = drag_c;
                 Monitor *m = c->mon;
                 Monitor *mp = mon_at(rx, ry);
@@ -1699,9 +1311,8 @@ static void process_event(XEvent *ev) {
                     if (mp != m && !mp->tiling) {
                         client_to_monitor(c, mp);
                         m = mp;
-                        View *v = &m->view[m->ws];
-                        c->fx = (int)lround(v->cx + (rx - m->x - m->w / 2.0) - drag_ox);
-                        c->fy = (int)lround(v->cy + (ry - m->y - m->h / 2.0) - drag_oy);
+                        c->fx = rx - m->x - drag_ox;
+                        c->fy = ry - m->y - drag_oy;
                         drag_px = rx;
                         drag_py = ry;
                         drag_fx = c->fx;
@@ -1773,10 +1384,6 @@ int main(void) {
     net_wm_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
 
     int err;
-    int comp_ev;
-    have_composite = XCompositeQueryExtension(dpy, &comp_ev, &err) && XDamageQueryExtension(dpy, &damage_event_base, &err)
-                     && XRenderFindVisualFormat(dpy, DefaultVisual(dpy, screen)) != NULL;
-    if (!have_composite) fprintf(stderr, "ghostwm: Composite/Damage/Render unavailable, zoom disabled\n");
     if (!XRRQueryExtension(dpy, &rr_event_base, &err)) {
         fprintf(stderr, "ghostwm: RandR is required\n");
         return 1;
@@ -1819,34 +1426,6 @@ int main(void) {
             process_event(&ev);
         }
 
-        double now = get_time_ms();
-        int animating = 0;
-
-        if (!panning && inertia_mon && (fabs(vel_x) >= 8.0 || fabs(vel_y) >= 8.0)) {
-            double dt = (now - last_tick_ms) / 1000.0;
-            last_tick_ms = now;
-            if (dt > 0.1) dt = 0.1;
-            pan_apply(inertia_mon, vel_x * dt, vel_y * dt);
-            double decay = pow(0.04, dt);
-            vel_x *= decay;
-            vel_y *= decay;
-            if (fabs(vel_x) < 8.0 && fabs(vel_y) < 8.0) {
-                vel_x = 0;
-                vel_y = 0;
-                if (!inertia_mon->overview) float_place(inertia_mon, 1);
-            } else {
-                animating = 1;
-            }
-        }
-
-        for (int i = 0; i < nmons; i++) {
-            if (mons[i]->overview && mons[i]->dirty) {
-                if (now - last_paint_ms >= 10.0) paint(mons[i]);
-                if (mons[i]->dirty) animating = 1;
-            }
-        }
-        if (now - last_paint_ms >= 10.0) last_paint_ms = now;
-
         XFlush(dpy);
         if (XPending(dpy)) continue;
 
@@ -1860,7 +1439,7 @@ int main(void) {
             pfd[np].events = POLLIN;
             np++;
         }
-        int rc = poll(pfd, (nfds_t)np, animating ? 8 : -1);
+        int rc = poll(pfd, (nfds_t)np, -1);
         if (rc > 0 && menu_fd >= 0 && np == 2 && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR))) menu_poll_result();
     }
 

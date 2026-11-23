@@ -69,6 +69,7 @@ int default_width = 1920;
 int default_height = 1080;
 int nws = 4;
 int sleep_timeout = 0;
+int fullscreen_keepalive = 1;
 char setup_cmd[1024] = "";
 char default_mon[64] = "";
 char order_cfg[256] = "";
@@ -214,6 +215,7 @@ static void load_config(void) {
             else if (!strcmp(key, "default_height")) default_height = clampi(atoi(val), 100, 16000);
             else if (!strcmp(key, "workspaces")) nws = clampi(atoi(val), 1, MAX_WS);
             else if (!strcmp(key, "sleep_timeout")) sleep_timeout = clampi(atoi(val), 0, 86400);
+            else if (!strcmp(key, "fullscreen_keepalive")) fullscreen_keepalive = (!strcmp(val, "true") || !strcmp(val, "1") || !strcmp(val, "yes"));
         } else if (!strcmp(section, "colors") && quoted) {
             if (!strcmp(key, "bg")) color_bg = strtoul(val, NULL, 0);
             else if (!strcmp(key, "fg")) color_fg = strtoul(val, NULL, 0);
@@ -390,6 +392,17 @@ static int should_show(Client *c) {
     return c->ws == c->mon->ws && !c->minimized;
 }
 
+/* Keep a fullscreen client mapped on a background workspace while another
+ * client is visible. On X11 this preserves IsViewable for apps such as
+ * Chromium, while the focused workspace's windows are stacked above it. */
+static int has_visible_peer(Client *c) {
+    for (int i = 0; i < nclients; i++) {
+        Client *other = clients[i];
+        if (other != c && other->mon == c->mon && should_show(other)) return 1;
+    }
+    return 0;
+}
+
 static Client *fallback_client(Monitor *m) {
     Client *s = m->sel[m->ws];
     if (s && s->mon == m && should_show(s)) return s;
@@ -433,7 +446,7 @@ static void sync_visibility(Monitor *m, int show_pass) {
     for (int i = 0; i < nclients; i++) {
         Client *c = clients[i];
         if (c->mon != m) continue;
-        int want = should_show(c);
+        int want = should_show(c) || (fullscreen_keepalive && c->fullscreen && !c->minimized && has_visible_peer(c));
         if (show_pass && want && !c->mapped) {
             XMapWindow(dpy, c->w);
             c->mapped = 1;
@@ -545,7 +558,15 @@ static void raise_client(Client *c) {
 static void set_focus(Client *c) {
     if (focused && focused != c) {
         XSetWindowBorder(dpy, focused->w, color_border);
-        if (c && focused->fullscreen && focused->mon == c->mon) set_fullscreen(focused, 0);
+        if (focused->fullscreen) {
+            if (fullscreen_keepalive) {
+                /* Do not send _NET_WM_STATE removal: keep the app fullscreen,
+                 * but move it behind the newly focused client. */
+                XLowerWindow(dpy, focused->w);
+            } else if (c && focused->mon == c->mon) {
+                set_fullscreen(focused, 0);
+            }
+        }
     }
     focused = c;
     if (c) {
@@ -553,6 +574,7 @@ static void set_focus(Client *c) {
         XSetWindowBorder(dpy, c->w, color_focus);
         c->last_focus = ++focus_counter;
         c->mon->sel[c->ws] = c;
+        if (c->fullscreen && c->mapped) XRaiseWindow(dpy, c->w);
     } else {
         XSetInputFocus(dpy, PointerRoot, RevertToPointerRoot, CurrentTime);
     }

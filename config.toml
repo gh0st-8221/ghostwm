@@ -1,0 +1,21 @@
+[general]
+border_width = 1
+default_width = 1200
+default_height = 800
+workspaces = 4
+sleep_timeout = 0
+fullscreen_keepalive = true
+
+[colors]
+bg = "0x000000"
+fg = "0xffffff"
+border = "0x303030"
+focus = "0x0000ff"
+
+[keys]
+"Mod4+f" = "fullscreen"
+"Mod4+Tab" = "alt-tab"
+"Mod4+1" = "workspace 1"
+"Mod4+2" = "workspace 2"
+"Mod4+3" = "workspace 3"
+"Mod4+4" = "workspace 4"
